@@ -12,5 +12,5 @@
 //  aqui sem problema. A proteção real vem das regras do banco (supabase.sql).
 // ============================================================
 
-export const SUPABASE_URL = "https://SEU-PROJETO.supabase.co";
-export const SUPABASE_ANON_KEY = "COLE_AQUI_SUA_CHAVE_ANON";
+export const SUPABASE_URL = "https://uecukylopesfvgsiyaxs.supabase.co/rest/v1/";
+export const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVlY3VreWxvcGVzZnZnc2l5YXhzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM3MzE4MzAsImV4cCI6MjA5OTMwNzgzMH0.YFvpMOxSABSPL3AbbloUgxmvrZGukBg5tZbSHmWCBaU";
