@@ -24,8 +24,14 @@ create table if not exists orders (
   selections jsonb not null default '{}'::jsonb,
   observacoes text default '',
   created_at int8 not null,
-  completed_at int8
+  completed_at int8,
+  skipped_at int8,
+  edited boolean not null default false
 );
+
+-- Migração (para bancos criados antes desta versão): adiciona as colunas novas.
+alter table orders add column if not exists skipped_at int8;
+alter table orders add column if not exists edited boolean not null default false;
 
 create table if not exists messages (
   id text primary key,
