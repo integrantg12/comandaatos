@@ -149,16 +149,33 @@ const orderFromRow = (r) => ({
   id: r.id, nome: r.nome, tipo: r.tipo, horario: r.horario || "", status: r.status,
   itens: r.itens || [], selections: r.selections || {}, observacoes: r.observacoes || "",
   createdAt: Number(r.created_at), completedAt: r.completed_at != null ? Number(r.completed_at) : null,
+  skippedAt: r.skipped_at != null ? Number(r.skipped_at) : null, edited: !!r.edited,
 });
 const orderToRow = (o) => ({
   id: o.id, nome: o.nome, tipo: o.tipo, horario: o.horario || "", status: o.status,
   itens: o.itens, selections: o.selections, observacoes: o.observacoes || "",
   created_at: o.createdAt, completed_at: o.completedAt,
+  skipped_at: o.skippedAt != null ? o.skippedAt : null, edited: !!o.edited,
 });
 const msgFromRow = (r) => ({ id: r.id, sender: r.sender, text: r.content, ts: Number(r.ts) });
 const msgToRow = (m) => ({ id: m.id, sender: m.sender, content: m.text, ts: m.ts });
 const menuFromRow = (r) => ({ id: r.id, nome: r.nome, categorias: r.categorias || [] });
 const menuToRow = (m) => ({ id: m.id, nome: m.nome, categorias: m.categorias });
+
+/* Agrupa pedidos por cliente, preservando a ordem de primeira aparição
+   da lista já ordenada (mesmo cliente fica junto). */
+function groupByClient(list) {
+  const groups = [];
+  const idx = {};
+  for (const o of list) {
+    const key = (o.nome || "").trim().toLowerCase();
+    if (idx[key] === undefined) { idx[key] = groups.length; groups.push({ nome: o.nome, items: [o] }); }
+    else groups[idx[key]].items.push(o);
+  }
+  return groups;
+}
+
+const SKIP_RETURN_MS = 20 * 60 * 1000; // pulados voltam à fila após 20 min
 
 /* ================================================================== */
 /*  Componentes reutilizáveis                                          */
@@ -264,7 +281,7 @@ function HorarioBadge({ info, tipo }) {
 function buildInitialForm(initial) {
   if (initial) {
     return {
-      nome: "",
+      nome: initial.mode === "edit" ? (initial.nome || "") : "",
       tipo: initial.tipo || "local",
       horario: initial.horario || "",
       obs: initial.observacoes || "",
@@ -276,6 +293,7 @@ function buildInitialForm(initial) {
 
 function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
   const [f, setF] = useState(() => buildInitialForm(initial));
+  const [editId, setEditId] = useState(initial && initial.mode === "edit" ? initial.editId : null);
 
   useEffect(() => { if (initial && onConsumedPrefill) onConsumedPrefill(); }, []); // eslint-disable-line
 
@@ -309,7 +327,8 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
       observacoes: f.obs.trim(),
       selections: JSON.parse(JSON.stringify(f.selections)),
       itens: resolveItens(menu, f.selections),
-    });
+    }, editId);
+    setEditId(null);
     setF(buildInitialForm(null));
   };
 
@@ -401,10 +420,11 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
       </div>
 
       <div className="sticky bottom-0 border-t border-slate-200 p-3" style={{ backgroundColor: "#f1f5f9" }}>
+        {editId && <p className="text-center text-xs font-bold text-amber-600 mb-1">✏️ Editando pedido enviado — as alterações vão para a cozinha</p>}
         {!canSubmit && <p className="text-center text-xs text-slate-400 mb-1">Informe o nome para enviar</p>}
         <button onClick={submit} disabled={!canSubmit}
-          className={"w-full rounded-2xl font-extrabold text-lg flex items-center justify-center gap-2 " + (canSubmit ? "bg-green-600 text-white active:bg-green-700" : "bg-slate-300 text-slate-500")} style={{ minHeight: "60px" }}>
-          <Send size={22} /> Enviar para Cozinha
+          className={"w-full rounded-2xl font-extrabold text-lg flex items-center justify-center gap-2 " + (canSubmit ? (editId ? "bg-amber-600 text-white active:bg-amber-700" : "bg-green-600 text-white active:bg-green-700") : "bg-slate-300 text-slate-500")} style={{ minHeight: "60px" }}>
+          {editId ? <><Check size={22} /> Salvar alterações</> : <><Send size={22} /> Enviar para Cozinha</>}
         </button>
       </div>
     </div>
@@ -415,7 +435,7 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
 /*  Visão Atendente                                                    */
 /* ================================================================== */
 
-function AtendenteView({ orders, menu, prefill, formSeed, nowTs, onCreate, onCancel, onRepeat, onConsumedPrefill }) {
+function AtendenteView({ orders, menu, prefill, formSeed, nowTs, headerH, onCreate, onEdit, onCancel, onRepeat, onConsumedPrefill }) {
   const [sub, setSub] = useState("novo");
   const [confirmingId, setConfirmingId] = useState(null);
 
@@ -423,10 +443,13 @@ function AtendenteView({ orders, menu, prefill, formSeed, nowTs, onCreate, onCan
 
   const activeCount = orders.filter((o) => ["na_fila", "preparando", "pulado"].includes(o.status)).length;
   const recent = [...orders].sort((a, b) => b.createdAt - a.createdAt);
+  const groups = groupByClient(recent);
+
+  const cancelavel = (o) => o.status !== "concluido" && o.status !== "cancelado";
 
   return (
     <div>
-      <div className="p-3">
+      <div className="sticky z-20 px-3 py-3" style={{ top: headerH, backgroundColor: "#f1f5f9" }}>
         <div className="grid grid-cols-2 gap-1 bg-slate-200 rounded-xl p-1">
           <Tab active={sub === "novo"} onClick={() => setSub("novo")} icon={<Plus size={18} />}>Novo Pedido</Tab>
           <Tab active={sub === "enviados"} onClick={() => setSub("enviados")} icon={<ClipboardList size={18} />} count={activeCount}>Enviados</Tab>
@@ -436,51 +459,65 @@ function AtendenteView({ orders, menu, prefill, formSeed, nowTs, onCreate, onCan
       {sub === "novo" ? (
         <OrderForm key={formSeed} menu={menu} initial={prefill} onSubmit={onCreate} onConsumedPrefill={onConsumedPrefill} />
       ) : (
-        <div className="p-4 space-y-3">
+        <div className="p-4 space-y-4">
           {recent.length === 0 && <Empty>Nenhum pedido enviado ainda.</Empty>}
-          {recent.map((o) => (
-            <div key={o.id} className="rounded-2xl border-2 border-slate-200 bg-white p-4">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2 min-w-0">
-                  <div className="rounded-lg bg-slate-900 text-white px-3 py-1 font-extrabold text-lg truncate" style={{ maxWidth: "170px" }}>{o.nome}</div>
-                  <StatusBadge status={o.status} />
+          {groups.map((g) => (
+            <div key={g.nome + g.items[0].id} className={g.items.length > 1 ? "rounded-2xl bg-slate-100 border-2 border-slate-200 p-2 space-y-2" : ""}>
+              {g.items.length > 1 && (
+                <div className="flex items-center gap-2 px-1 pt-1">
+                  <span className="rounded-lg bg-slate-900 text-white px-3 py-1 font-extrabold">{g.nome}</span>
+                  <span className="text-xs font-bold text-slate-500">{g.items.length} pedidos</span>
                 </div>
-                <div className="text-xs text-slate-400 shrink-0">{relTime(o.createdAt, nowTs)}</div>
-              </div>
-
-              <div className="mt-2 flex flex-wrap items-center gap-2">
-                <TipoBadge tipo={o.tipo} size="sm" />
-                {o.horario && (
-                  <span className="text-xs font-semibold text-indigo-700 flex items-center gap-1">
-                    <Timer size={12} /> {o.tipo === "entrega" ? "Entregar" : "Servir"} {o.horario}
-                  </span>
-                )}
-              </div>
-
-              <p className={"mt-2 text-sm " + (o.status === "cancelado" ? "line-through text-slate-400" : "text-slate-600")}>{flatSummary(o)}</p>
-              {o.observacoes.trim() && (
-                <p className="mt-1 text-sm text-red-600 flex items-start gap-1"><AlertTriangle size={14} className="mt-0.5 shrink-0" /> {o.observacoes}</p>
               )}
-
-              <div className="mt-3 grid grid-cols-2 gap-2">
-                <button onClick={() => { onRepeat(o); setSub("novo"); }} className="rounded-xl border-2 border-emerald-200 text-emerald-700 font-bold flex items-center justify-center gap-2" style={{ minHeight: "46px" }}>
-                  <Copy size={16} /> Repetir
-                </button>
-                {o.status !== "concluido" && o.status !== "cancelado" ? (
-                  confirmingId === o.id ? (
-                    <div className="flex gap-1">
-                      <button onClick={() => { onCancel(o.id); setConfirmingId(null); }} className="flex-1 rounded-xl bg-red-600 text-white font-bold text-sm" style={{ minHeight: "46px" }}>Sim</button>
-                      <button onClick={() => setConfirmingId(null)} className="flex-1 rounded-xl bg-slate-200 text-slate-700 font-bold text-sm" style={{ minHeight: "46px" }}>Não</button>
+              {g.items.map((o) => (
+                <div key={o.id} className="rounded-2xl border-2 border-slate-200 bg-white p-4">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                      <div className="rounded-lg bg-slate-900 text-white px-3 py-1 font-extrabold text-lg truncate" style={{ maxWidth: "170px" }}>{o.nome}</div>
+                      <StatusBadge status={o.status} />
+                      {o.edited && <span className="rounded-full bg-amber-100 text-amber-800 text-xs font-bold px-2 py-0.5">EDITADO</span>}
                     </div>
-                  ) : (
-                    <button onClick={() => setConfirmingId(o.id)} className="rounded-xl border-2 border-red-200 text-red-600 font-bold flex items-center justify-center gap-2" style={{ minHeight: "46px" }}>
-                      <Trash2 size={16} /> Cancelar
+                    <div className="text-xs text-slate-400 shrink-0">{relTime(o.createdAt, nowTs)}</div>
+                  </div>
+
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <TipoBadge tipo={o.tipo} size="sm" />
+                    {o.horario && (
+                      <span className="text-xs font-semibold text-indigo-700 flex items-center gap-1">
+                        <Timer size={12} /> {o.tipo === "entrega" ? "Entregar" : "Servir"} {o.horario}
+                      </span>
+                    )}
+                  </div>
+
+                  <p className={"mt-2 text-sm " + (o.status === "cancelado" ? "line-through text-slate-400" : "text-slate-600")}>{flatSummary(o)}</p>
+                  {o.observacoes.trim() && (
+                    <p className="mt-1 text-sm text-red-600 flex items-start gap-1"><AlertTriangle size={14} className="mt-0.5 shrink-0" /> {o.observacoes}</p>
+                  )}
+
+                  <div className="mt-3 grid grid-cols-3 gap-2">
+                    {cancelavel(o) ? (
+                      <button onClick={() => { onEdit(o); setSub("novo"); }} className="rounded-xl border-2 border-amber-300 text-amber-700 font-bold flex items-center justify-center gap-1" style={{ minHeight: "46px" }}>
+                        <Check size={16} /> Editar
+                      </button>
+                    ) : <div />}
+                    <button onClick={() => { onRepeat(o); setSub("novo"); }} className="rounded-xl border-2 border-emerald-200 text-emerald-700 font-bold flex items-center justify-center gap-1" style={{ minHeight: "46px" }}>
+                      <Copy size={16} /> Repetir
                     </button>
-                  )
-                ) : (
-                  <div />
-                )}
-              </div>
+                    {cancelavel(o) ? (
+                      confirmingId === o.id ? (
+                        <div className="flex gap-1">
+                          <button onClick={() => { onCancel(o.id); setConfirmingId(null); }} className="flex-1 rounded-xl bg-red-600 text-white font-bold text-sm" style={{ minHeight: "46px" }}>Sim</button>
+                          <button onClick={() => setConfirmingId(null)} className="flex-1 rounded-xl bg-slate-200 text-slate-700 font-bold text-sm" style={{ minHeight: "46px" }}>Não</button>
+                        </div>
+                      ) : (
+                        <button onClick={() => setConfirmingId(o.id)} className="rounded-xl border-2 border-red-200 text-red-600 font-bold flex items-center justify-center gap-1" style={{ minHeight: "46px" }}>
+                          <Trash2 size={16} /> Cancelar
+                        </button>
+                      )
+                    ) : <div />}
+                  </div>
+                </div>
+              ))}
             </div>
           ))}
         </div>
@@ -493,13 +530,32 @@ function AtendenteView({ orders, menu, prefill, formSeed, nowTs, onCreate, onCan
 /*  Card + Visão Cozinha                                               */
 /* ================================================================== */
 
-function KitchenCard({ order, nowTs, variant, onPrepare, onComplete, onSkip, onBackToQueue }) {
+function KitchenCard({ order, nowTs, variant, highlight, onPrepare, onComplete, onSkip, onBackToQueue }) {
   const preparing = order.status === "preparando";
   const isNew = variant === "fila" && nowTs - order.createdAt < 20000;
   const hInfo = horarioInfo(order, nowTs);
+  const urgente = variant === "fila" && hInfo && hInfo.level === "urgente";
+  const breve = variant === "fila" && hInfo && hInfo.level === "breve";
+  const overdue = urgente && hInfo.diffMin <= 0;
+
+  // contagem regressiva para pulados voltarem à fila
+  let skipLeft = null;
+  if (variant === "pulado" && order.skippedAt) {
+    skipLeft = Math.max(0, Math.ceil((order.skippedAt + SKIP_RETURN_MS - nowTs) / 60000));
+  }
+
+  const cardTone = highlight
+    ? "border-slate-900 bg-white ring-4 ring-slate-900"
+    : urgente
+    ? "border-red-500 bg-red-50 shadow-md"
+    : breve
+    ? "border-amber-400 bg-amber-50"
+    : preparing
+    ? "border-blue-400 bg-white"
+    : "border-slate-200 bg-white";
 
   return (
-    <div className={"rounded-2xl border-2 bg-white p-4 shadow-sm " + (preparing ? "border-blue-400" : "border-slate-200")}>
+    <div id={"card-" + order.id} className={"rounded-2xl border-2 p-4 shadow-sm transition-colors " + cardTone + (urgente ? " animate-pulse" : "")}>
       <div className="flex items-start justify-between gap-3 mb-2">
         <div className="min-w-0">
           <div className="text-xs font-medium text-slate-400 leading-none mb-0.5">PEDIDO</div>
@@ -507,7 +563,9 @@ function KitchenCard({ order, nowTs, variant, onPrepare, onComplete, onSkip, onB
           <div className="text-xs text-slate-500 flex items-center gap-1 mt-1"><Clock size={14} /> recebido {relTime(order.createdAt, nowTs)}</div>
         </div>
         <div className="flex flex-col items-end gap-1 shrink-0">
+          {overdue && <span className="rounded-full bg-red-600 text-white text-xs font-bold px-2 py-0.5">ATRASADO</span>}
           {isNew && <span className="rounded-full bg-emerald-500 text-white text-xs font-bold px-2 py-0.5 animate-pulse">NOVO</span>}
+          {order.edited && <span className="rounded-full bg-amber-100 text-amber-800 text-xs font-bold px-2 py-0.5">EDITADO</span>}
           {preparing && <span className="rounded-full bg-blue-100 text-blue-700 text-xs font-bold px-2 py-0.5">EM PREPARO</span>}
         </div>
       </div>
@@ -559,13 +617,20 @@ function KitchenCard({ order, nowTs, variant, onPrepare, onComplete, onSkip, onB
           </div>
         )}
         {variant === "pulado" && (
-          <div className="grid grid-cols-2 gap-2">
-            <button onClick={() => onBackToQueue(order.id)} className="rounded-xl font-bold bg-slate-200 text-slate-800 flex items-center justify-center gap-2 active:bg-slate-300" style={{ minHeight: "56px" }}>
-              <RotateCcw size={20} /> Voltar p/ Fila
-            </button>
-            <button onClick={() => onComplete(order.id)} className="rounded-xl font-extrabold bg-green-600 text-white flex items-center justify-center gap-2 active:bg-green-700" style={{ minHeight: "56px" }}>
-              <CheckCircle2 size={20} /> Concluído
-            </button>
+          <div className="space-y-2">
+            {skipLeft !== null && (
+              <div className="text-xs font-semibold text-amber-700 flex items-center gap-1 justify-center">
+                <RotateCcw size={13} /> {skipLeft > 0 ? `Volta para a fila em ${skipLeft} min` : "Voltando para a fila..."}
+              </div>
+            )}
+            <div className="grid grid-cols-2 gap-2">
+              <button onClick={() => onBackToQueue(order.id)} className="rounded-xl font-bold bg-slate-200 text-slate-800 flex items-center justify-center gap-2 active:bg-slate-300" style={{ minHeight: "56px" }}>
+                <RotateCcw size={20} /> Voltar p/ Fila
+              </button>
+              <button onClick={() => onComplete(order.id)} className="rounded-xl font-extrabold bg-green-600 text-white flex items-center justify-center gap-2 active:bg-green-700" style={{ minHeight: "56px" }}>
+                <CheckCircle2 size={20} /> Concluído
+              </button>
+            </div>
           </div>
         )}
       </div>
@@ -573,27 +638,137 @@ function KitchenCard({ order, nowTs, variant, onPrepare, onComplete, onSkip, onB
   );
 }
 
-function CozinhaView({ orders, nowTs, onPrepare, onComplete, onSkip, onBackToQueue, onClearHistory }) {
+function fmtHM(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts);
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+function gerarRelatorioPDF(entregues) {
+  const rows = [...entregues].sort((a, b) => (a.completedAt || 0) - (b.completedAt || 0));
+  const now = new Date();
+  const dataStr = now.toLocaleDateString("pt-BR", { weekday: "long", day: "2-digit", month: "long", year: "numeric" });
+  const totalLocal = rows.filter((o) => o.tipo !== "entrega").length;
+  const totalEntrega = rows.filter((o) => o.tipo === "entrega").length;
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const trs = rows.map((o, i) => `<tr>
+      <td class="c">${i + 1}</td>
+      <td><b>${esc(o.nome)}</b></td>
+      <td class="c">${o.tipo === "entrega" ? "🚲 Entrega" : "🏠 Local"}</td>
+      <td class="c">${o.horario ? esc(o.horario) : "—"}</td>
+      <td>${esc(flatSummary(o))}</td>
+      <td class="obs">${esc(o.observacoes || "")}</td>
+      <td class="c">${fmtHM(o.completedAt)}</td>
+    </tr>`).join("");
+  const html = `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+    <title>Relatório de Pedidos — ${esc(dataStr)}</title>
+    <style>
+      *{box-sizing:border-box} body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#0f172a;margin:24px}
+      h1{margin:0 0 2px;font-size:20px} .sub{color:#64748b;font-size:13px;margin-bottom:14px}
+      .cards{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap}
+      .kpi{border:2px solid #e2e8f0;border-radius:12px;padding:10px 16px}
+      .kpi b{display:block;font-size:22px} .kpi span{font-size:12px;color:#64748b}
+      table{width:100%;border-collapse:collapse;font-size:13px}
+      th,td{border:1px solid #e2e8f0;padding:7px 9px;text-align:left;vertical-align:top}
+      th{background:#f1f5f9;font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:#475569}
+      td.c{text-align:center;white-space:nowrap} td.obs{color:#b91c1c}
+      tr:nth-child(even) td{background:#fafafa}
+      .print{margin-top:18px;padding:12px 18px;border:0;border-radius:10px;background:#059669;color:#fff;font-weight:700;font-size:15px;cursor:pointer}
+      @media print{.print{display:none}body{margin:0}}
+    </style></head><body>
+    <h1>🍴 Relatório de Pedidos — Comanda Digital</h1>
+    <div class="sub">${esc(dataStr)} · gerado às ${pad2(now.getHours())}:${pad2(now.getMinutes())}</div>
+    <div class="cards">
+      <div class="kpi"><b>${rows.length}</b><span>Pratos entregues</span></div>
+      <div class="kpi"><b>${totalLocal}</b><span>No local</span></div>
+      <div class="kpi"><b>${totalEntrega}</b><span>Entregas</span></div>
+    </div>
+    <table><thead><tr><th>#</th><th>Cliente</th><th>Tipo</th><th>Horário</th><th>Itens</th><th>Observações</th><th>Concluído</th></tr></thead>
+    <tbody>${trs || '<tr><td colspan="7" class="c">Nenhum pedido.</td></tr>'}</tbody></table>
+    <button class="print" onclick="window.print()">🖨️ Imprimir / Salvar como PDF</button>
+    <script>window.onload=function(){setTimeout(function(){window.print();},400);};</script>
+    </body></html>`;
+  const w = window.open("", "_blank");
+  if (!w) { alert("Permita pop-ups (janelas) neste site para gerar o relatório."); return; }
+  w.document.open(); w.document.write(html); w.document.close();
+}
+
+function CozinhaView({ orders, nowTs, headerH, onPrepare, onComplete, onSkip, onBackToQueue, onClearHistory }) {
   const [tab, setTab] = useState("fila");
+  const [highlightId, setHighlightId] = useState(null);
+
   const fila = orders.filter((o) => o.status === "na_fila" || o.status === "preparando").sort((a, b) => targetTs(a, nowTs) - targetTs(b, nowTs));
-  const pulados = orders.filter((o) => o.status === "pulado").sort((a, b) => a.createdAt - b.createdAt);
+  const pulados = orders.filter((o) => o.status === "pulado").sort((a, b) => (a.skippedAt || a.createdAt) - (b.skippedAt || b.createdAt));
   const entregues = orders.filter((o) => o.status === "concluido").sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0));
+
+  const filaGroups = groupByClient(fila);
+  const alertas = fila.filter((o) => { const h = horarioInfo(o, nowTs); return h && h.level === "urgente"; });
+
+  const irParaPedido = (id) => {
+    setTab("fila");
+    setTimeout(() => {
+      const el = document.getElementById("card-" + id);
+      if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+      setHighlightId(id);
+      setTimeout(() => setHighlightId(null), 2600);
+    }, 70);
+  };
 
   return (
     <div>
-      <div className="p-3">
-        <div className="grid grid-cols-3 gap-1 bg-slate-200 rounded-xl p-1">
-          <Tab active={tab === "fila"} onClick={() => setTab("fila")} count={fila.length}>Fila</Tab>
-          <Tab active={tab === "pulados"} onClick={() => setTab("pulados")} count={pulados.length}>Pulados</Tab>
-          <Tab active={tab === "entregues"} onClick={() => setTab("entregues")} count={entregues.length}>Entregues</Tab>
+      <div className="sticky z-20" style={{ top: headerH, backgroundColor: "#f1f5f9" }}>
+        <div className="px-3 pt-3 pb-2">
+          <div className="grid grid-cols-3 gap-1 bg-slate-200 rounded-xl p-1">
+            <Tab active={tab === "fila"} onClick={() => setTab("fila")} count={fila.length}>Fila</Tab>
+            <Tab active={tab === "pulados"} onClick={() => setTab("pulados")} count={pulados.length}>Pulados</Tab>
+            <Tab active={tab === "entregues"} onClick={() => setTab("entregues")} count={entregues.length}>Entregues</Tab>
+          </div>
         </div>
+
+        {alertas.length > 0 && (
+          <div className="px-3 pb-2">
+            <div className="rounded-xl border-2 border-red-500 bg-red-600 text-white p-2 animate-pulse">
+              <div className="flex items-center gap-2 font-bold text-sm px-1 mb-1"><Bell size={16} /> Atenção ao horário — toque para ir ao pedido</div>
+              <div className="flex flex-col gap-1">
+                {alertas.slice(0, 4).map((o) => {
+                  const h = horarioInfo(o, nowTs);
+                  const rel = h.diffMin <= 0 ? `ATRASADO ${Math.abs(h.diffMin)} min` : `em ${h.diffMin} min`;
+                  return (
+                    <button key={o.id} onClick={() => irParaPedido(o.id)} className="w-full text-left rounded-lg bg-white/15 active:bg-white/25 px-3 py-2 flex items-center justify-between gap-2">
+                      <span className="font-bold truncate">{o.tipo === "entrega" ? "🚲 " : ""}{o.nome}</span>
+                      <span className="text-sm font-extrabold shrink-0">{o.horario} · {rel}</span>
+                    </button>
+                  );
+                })}
+                {alertas.length > 4 && <div className="text-xs px-1">+{alertas.length - 4} outro(s) próximo(s) do horário</div>}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="p-4 space-y-4">
-        {tab === "fila" && (fila.length ? fila.map((o) => <KitchenCard key={o.id} order={o} nowTs={nowTs} variant="fila" onPrepare={onPrepare} onComplete={onComplete} onSkip={onSkip} />) : <Empty>Nenhum pedido na fila. Tudo em dia! 🎉</Empty>)}
+        {tab === "fila" && (fila.length ? filaGroups.map((g) => (
+          g.items.length > 1 ? (
+            <div key={g.nome + g.items[0].id} className="rounded-2xl bg-slate-100 border-2 border-slate-300 p-2 space-y-2">
+              <div className="flex items-center gap-2 px-1 pt-1">
+                <span className="rounded-lg bg-slate-900 text-white px-3 py-1 font-extrabold">{g.nome}</span>
+                <span className="text-xs font-bold text-slate-500">{g.items.length} pedidos deste cliente</span>
+              </div>
+              {g.items.map((o) => <KitchenCard key={o.id} order={o} nowTs={nowTs} variant="fila" highlight={highlightId === o.id} onPrepare={onPrepare} onComplete={onComplete} onSkip={onSkip} />)}
+            </div>
+          ) : (
+            <KitchenCard key={g.items[0].id} order={g.items[0]} nowTs={nowTs} variant="fila" highlight={highlightId === g.items[0].id} onPrepare={onPrepare} onComplete={onComplete} onSkip={onSkip} />
+          )
+        )) : <Empty>Nenhum pedido na fila. Tudo em dia! 🎉</Empty>)}
+
         {tab === "pulados" && (pulados.length ? pulados.map((o) => <KitchenCard key={o.id} order={o} nowTs={nowTs} variant="pulado" onComplete={onComplete} onBackToQueue={onBackToQueue} />) : <Empty>Nenhum pedido aguardando.</Empty>)}
+
         {tab === "entregues" && (entregues.length ? (
           <>
+            <button onClick={() => gerarRelatorioPDF(entregues)} className="w-full rounded-xl bg-slate-900 text-white font-bold flex items-center justify-center gap-2" style={{ minHeight: "50px" }}>
+              <ClipboardList size={18} /> Gerar relatório (PDF)
+            </button>
             {entregues.map((o) => (
               <div key={o.id} className="rounded-2xl border-2 border-slate-200 bg-white p-4">
                 <div className="flex items-center justify-between gap-2">
@@ -872,6 +1047,8 @@ function ComandaApp() {
 
   const audioRef = useRef(null);
   const timers = useRef({});
+  const headerRef = useRef(null);
+  const [headerH, setHeaderH] = useState(0);
 
   const role = view === "cozinha" ? "cozinha" : "atendente";
   const roleRef = useRef(role); roleRef.current = role;
@@ -880,8 +1057,16 @@ function ComandaApp() {
   const unread = messages.filter((m) => m.sender !== role && m.ts > (lastOpen[role] || 0)).length;
   const activeMenu = menus.find((m) => m.id === activeMenuId) || menus[0] || null;
 
-  useEffect(() => { const i = setInterval(() => setNowTs(Date.now()), 15000); return () => clearInterval(i); }, []);
+  useEffect(() => { const i = setInterval(() => setNowTs(Date.now()), 10000); return () => clearInterval(i); }, []);
   useEffect(() => () => Object.values(timers.current).forEach(clearTimeout), []);
+
+  // mede a altura do cabeçalho para posicionar os menus fixos logo abaixo dele
+  useEffect(() => {
+    const measure = () => { if (headerRef.current) setHeaderH(headerRef.current.offsetHeight); };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [view]);
 
   /* Sons */
   const playTone = (freqs, type, gain) => {
@@ -971,9 +1156,31 @@ function ComandaApp() {
     return () => { if (channel) supabase.removeChannel(channel); };
   }, []);
 
+  // Pulados voltam automaticamente para a fila após 20 minutos
+  useEffect(() => {
+    if (!ready) return;
+    const expirados = orders.filter((o) => o.status === "pulado" && o.skippedAt && nowTs - o.skippedAt >= SKIP_RETURN_MS);
+    expirados.forEach((o) => {
+      upsertOrder({ ...o, status: "na_fila", skippedAt: null });
+      supabase.from("orders").update({ status: "na_fila", skipped_at: null }).eq("id", o.id).then(({ error }) => dbFail(error));
+    });
+  }, [nowTs, ready]); // eslint-disable-line
+
   /* Ações — atualização otimista + gravação no banco */
-  const createOrder = (data) => {
-    const o = { id: uid(), createdAt: Date.now(), completedAt: null, status: "na_fila", ...data };
+  const createOrder = (data, editId) => {
+    if (editId) {
+      const cur = orders.find((x) => x.id === editId);
+      if (!cur) return;
+      const upd = { ...cur, ...data, edited: true };
+      upsertOrder(upd);
+      pushToast({ type: "success", message: `Pedido de ${data.nome} atualizado`, duration: 2500 });
+      supabase.from("orders").update({
+        nome: data.nome, tipo: data.tipo, horario: data.horario, observacoes: data.observacoes,
+        itens: data.itens, selections: data.selections, edited: true,
+      }).eq("id", editId).then(({ error }) => dbFail(error));
+      return;
+    }
+    const o = { id: uid(), createdAt: Date.now(), completedAt: null, status: "na_fila", edited: false, skippedAt: null, ...data };
     upsertOrder(o);
     pushToast({ type: "success", message: `Pedido de ${data.nome} enviado para a cozinha`, duration: 2500 });
     supabase.from("orders").insert(orderToRow(o)).then(({ error }) => dbFail(error));
@@ -992,20 +1199,21 @@ function ComandaApp() {
   };
   const skipOrder = (id) => {
     const o = orders.find((x) => x.id === id); if (!o) return;
-    upsertOrder({ ...o, status: "pulado" });
-    supabase.from("orders").update({ status: "pulado" }).eq("id", id).then(({ error }) => dbFail(error));
+    const ts = Date.now();
+    upsertOrder({ ...o, status: "pulado", skippedAt: ts });
+    supabase.from("orders").update({ status: "pulado", skipped_at: ts }).eq("id", id).then(({ error }) => dbFail(error));
   };
   const backToQueue = (id) => {
     const o = orders.find((x) => x.id === id); if (!o) return;
-    upsertOrder({ ...o, status: "na_fila" });
-    supabase.from("orders").update({ status: "na_fila" }).eq("id", id).then(({ error }) => dbFail(error));
+    upsertOrder({ ...o, status: "na_fila", skippedAt: null });
+    supabase.from("orders").update({ status: "na_fila", skipped_at: null }).eq("id", id).then(({ error }) => dbFail(error));
   };
   const completeOrder = (id) => {
     const o = orders.find((x) => x.id === id); if (!o || o.status === "concluido") return;
     const prevStatus = o.status; const ts = Date.now();
-    upsertOrder({ ...o, status: "concluido", completedAt: ts });
+    upsertOrder({ ...o, status: "concluido", completedAt: ts, skippedAt: null });
     pushToast({ type: "undo", nome: o.nome, orderId: id, prevStatus, duration: 5000 });
-    supabase.from("orders").update({ status: "concluido", completed_at: ts }).eq("id", id).then(({ error }) => dbFail(error));
+    supabase.from("orders").update({ status: "concluido", completed_at: ts, skipped_at: null }).eq("id", id).then(({ error }) => dbFail(error));
   };
   const undoComplete = (toast) => {
     const o = orders.find((x) => x.id === toast.orderId);
@@ -1020,7 +1228,12 @@ function ComandaApp() {
   };
 
   const repeatOrder = (order) => {
-    setPrefill({ tipo: order.tipo, horario: order.horario, observacoes: order.observacoes, selections: order.selections });
+    setPrefill({ mode: "repeat", tipo: order.tipo, horario: order.horario, observacoes: order.observacoes, selections: order.selections });
+    setFormSeed((n) => n + 1);
+    setView("atendente");
+  };
+  const editOrder = (order) => {
+    setPrefill({ mode: "edit", editId: order.id, nome: order.nome, tipo: order.tipo, horario: order.horario, observacoes: order.observacoes, selections: order.selections });
     setFormSeed((n) => n + 1);
     setView("atendente");
   };
@@ -1053,7 +1266,7 @@ function ComandaApp() {
     <div className="min-h-screen flex flex-col text-slate-900" style={{ backgroundColor: "#f1f5f9" }}>
       <style>{`@keyframes undobar{from{width:100%}to{width:0%}}`}</style>
 
-      <header className="sticky top-0 z-30 bg-white border-b border-slate-200">
+      <header ref={headerRef} className="sticky top-0 z-30 bg-white border-b border-slate-200">
         <div className="flex items-center justify-between px-4 py-3 max-w-xl mx-auto w-full">
           <div className="flex items-center gap-2 font-extrabold text-slate-800">
             <span className="rounded-lg bg-emerald-600 text-white p-1.5"><Utensils size={18} /></span>
@@ -1091,11 +1304,11 @@ function ComandaApp() {
         ) : (
           <>
             {view === "atendente" && (activeMenu ? (
-              <AtendenteView orders={orders} menu={activeMenu} prefill={prefill} formSeed={formSeed} nowTs={nowTs}
-                onCreate={createOrder} onCancel={cancelOrder} onRepeat={repeatOrder} onConsumedPrefill={consumedPrefill} />
+              <AtendenteView orders={orders} menu={activeMenu} prefill={prefill} formSeed={formSeed} nowTs={nowTs} headerH={headerH}
+                onCreate={createOrder} onEdit={editOrder} onCancel={cancelOrder} onRepeat={repeatOrder} onConsumedPrefill={consumedPrefill} />
             ) : <div className="p-8"><Empty>Nenhum cardápio ativo. Vá em Administração.</Empty></div>)}
             {view === "cozinha" && (
-              <CozinhaView orders={orders} nowTs={nowTs} onPrepare={prepareToggle} onComplete={completeOrder} onSkip={skipOrder} onBackToQueue={backToQueue} onClearHistory={clearHistory} />
+              <CozinhaView orders={orders} nowTs={nowTs} headerH={headerH} onPrepare={prepareToggle} onComplete={completeOrder} onSkip={skipOrder} onBackToQueue={backToQueue} onClearHistory={clearHistory} />
             )}
             {view === "admin" && (
               <AdminView menus={menus} activeMenuId={activeMenuId} onCreateMenu={createMenu} onSaveMenu={saveMenu} onDeleteMenu={deleteMenu} onSetActive={setActive} />
