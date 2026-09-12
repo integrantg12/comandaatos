@@ -3,6 +3,7 @@ import {
   Utensils, ChefHat, User, Settings, Volume2, VolumeX, MessageSquare, Send, X, Check,
   SkipForward, RotateCcw, CheckCircle2, AlertTriangle, Clock, Timer, Trash2, Undo2,
   ClipboardList, Plus, Bell, Copy, Home, Bike, Star, Save, WifiOff,
+  MapPin, Navigation, Coffee, Package,
 } from "lucide-react";
 import { supabase, isConfigured } from "./supabaseClient";
 
@@ -14,6 +15,8 @@ const STATUS = {
   na_fila:    { label: "Na Fila",    classes: "bg-slate-200 text-slate-700" },
   preparando: { label: "Preparando", classes: "bg-blue-100 text-blue-700" },
   pulado:     { label: "Pulado",     classes: "bg-amber-100 text-amber-800" },
+  aguardando_entrega: { label: "Com o entregador", classes: "bg-purple-100 text-purple-700" },
+  em_rota:    { label: "Saiu p/ entrega", classes: "bg-purple-600 text-white" },
   concluido:  { label: "Concluído",  classes: "bg-green-100 text-green-700" },
   cancelado:  { label: "Cancelado",  classes: "bg-red-100 text-red-600" },
 };
@@ -56,6 +59,52 @@ function horarioInfo(o, nowTs) {
 
 const isProteinCat = (nome) => /prote|mistura/i.test(nome || "");
 
+/* ---- Bebidas -------------------------------------------------------
+   Detecta a categoria de bebida pelo nome (funciona com cardápios
+   personalizados: "Bebida", "Bebidas", "Refrigerantes", "Sucos"...). */
+const isBebidaCat = (nome) => /bebid|refri|suco|drink|liquid/i.test(nome || "");
+
+/* Lista as bebidas marcadas no pedido (ex: ["Refri (Coca)", "Guaravita"]). */
+function bebidasDoPedido(order) {
+  const out = [];
+  (order.itens || []).forEach((g) => { if (isBebidaCat(g.categoria)) g.valores.forEach((v) => out.push(v)); });
+  return out;
+}
+const temBebida = (order) => bebidasDoPedido(order).length > 0;
+
+/* ---- Entrega ------------------------------------------------------- */
+const ENTREGA_STATUS = ["aguardando_entrega", "em_rota"];
+const isEntregaAtiva = (o) => ENTREGA_STATUS.includes(o.status);
+
+const enderecoCompleto = (o) => {
+  const e = (o.endereco || "").trim();
+  const r = (o.referencia || "").trim();
+  if (!e) return r;
+  return r ? `${e} — ${r}` : e;
+};
+/* Só o endereço vai para a rota; a referência atrapalharia o mapa. */
+const mapsUrl = (o) =>
+  `https://www.google.com/maps/dir/?api=1&travelmode=driving&destination=${encodeURIComponent((o.endereco || "").trim())}`;
+const wazeUrl = (o) =>
+  `https://www.waze.com/ul?navigate=yes&q=${encodeURIComponent((o.endereco || "").trim())}`;
+
+function copiarTexto(txt, onOk) {
+  const done = () => { if (onOk) onOk(); };
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(txt).then(done).catch(() => done());
+      return;
+    }
+  } catch (e) { /* ignore */ }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = txt; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select(); document.execCommand("copy");
+    document.body.removeChild(ta);
+  } catch (e) { /* ignore */ }
+  done();
+}
+
 function resolveItens(menu, selections) {
   if (!menu) return [];
   return menu.categorias
@@ -73,7 +122,7 @@ function resolveItens(menu, selections) {
           valores.push(item.label);
         }
       });
-      return { categoria: cat.nome, valores, destaque: isProteinCat(cat.nome) };
+      return { categoria: cat.nome, valores, destaque: isProteinCat(cat.nome), bebida: isBebidaCat(cat.nome) };
     })
     .filter((g) => g.valores.length);
 }
@@ -150,12 +199,18 @@ const orderFromRow = (r) => ({
   itens: r.itens || [], selections: r.selections || {}, observacoes: r.observacoes || "",
   createdAt: Number(r.created_at), completedAt: r.completed_at != null ? Number(r.completed_at) : null,
   skippedAt: r.skipped_at != null ? Number(r.skipped_at) : null, edited: !!r.edited,
+  endereco: r.endereco || "", referencia: r.referencia || "",
+  readyAt: r.ready_at != null ? Number(r.ready_at) : null,
+  outAt: r.out_at != null ? Number(r.out_at) : null,
 });
 const orderToRow = (o) => ({
   id: o.id, nome: o.nome, tipo: o.tipo, horario: o.horario || "", status: o.status,
   itens: o.itens, selections: o.selections, observacoes: o.observacoes || "",
   created_at: o.createdAt, completed_at: o.completedAt,
   skipped_at: o.skippedAt != null ? o.skippedAt : null, edited: !!o.edited,
+  endereco: o.endereco || "", referencia: o.referencia || "",
+  ready_at: o.readyAt != null ? o.readyAt : null,
+  out_at: o.outAt != null ? o.outAt : null,
 });
 const msgFromRow = (r) => ({ id: r.id, sender: r.sender, text: r.content, ts: Number(r.ts) });
 const msgToRow = (m) => ({ id: m.id, sender: m.sender, content: m.text, ts: m.ts });
@@ -285,10 +340,12 @@ function buildInitialForm(initial) {
       tipo: initial.tipo || "local",
       horario: initial.horario || "",
       obs: initial.observacoes || "",
+      endereco: initial.endereco || "",
+      referencia: initial.referencia || "",
       selections: JSON.parse(JSON.stringify(initial.selections || {})),
     };
   }
-  return { nome: "", tipo: "local", horario: "", obs: "", selections: {} };
+  return { nome: "", tipo: "local", horario: "", obs: "", endereco: "", referencia: "", selections: {} };
 }
 
 function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
@@ -317,7 +374,9 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
   const setText = (cat, item, text) => setSel(cat.id, item.id, { on: true, text });
   const setTop = (k, v) => setF((p) => ({ ...p, [k]: v }));
 
-  const canSubmit = f.nome.trim().length > 0;
+  const precisaEndereco = f.tipo === "entrega";
+  const enderecoOk = !precisaEndereco || f.endereco.trim().length > 0;
+  const canSubmit = f.nome.trim().length > 0 && enderecoOk;
   const submit = () => {
     if (!canSubmit) return;
     onSubmit({
@@ -325,6 +384,8 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
       tipo: f.tipo,
       horario: f.horario,
       observacoes: f.obs.trim(),
+      endereco: f.tipo === "entrega" ? f.endereco.trim() : "",
+      referencia: f.tipo === "entrega" ? f.referencia.trim() : "",
       selections: JSON.parse(JSON.stringify(f.selections)),
       itens: resolveItens(menu, f.selections),
     }, editId);
@@ -355,6 +416,31 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
             </button>
           </div>
         </Section>
+
+        {f.tipo === "entrega" && (
+          <div className="rounded-2xl border-2 border-indigo-300 bg-indigo-50 p-3 space-y-3">
+            <div className="flex items-center gap-2 text-indigo-800 font-bold text-sm uppercase tracking-wide">
+              <MapPin size={16} /> Endereço da entrega
+            </div>
+            <div>
+              <div className="text-xs font-semibold text-slate-600 mb-1">Endereço (rua, número, bairro)</div>
+              <textarea value={f.endereco} onChange={(e) => setTop("endereco", e.target.value)} rows={2}
+                placeholder="Ex: Rua das Flores, 120 — Centro, Teresópolis"
+                className={inputCls + " resize-none bg-white"} />
+            </div>
+            <div>
+              <div className="text-xs font-semibold text-slate-600 mb-1">Ponto de referência (opcional)</div>
+              <input value={f.referencia} onChange={(e) => setTop("referencia", e.target.value)}
+                placeholder="Ex: casa azul, ao lado da padaria; portão 2"
+                className={inputCls + " bg-white"} />
+            </div>
+            {!enderecoOk && (
+              <p className="text-xs text-red-600 font-semibold flex items-center gap-1">
+                <AlertTriangle size={12} /> O endereço é obrigatório para entrega
+              </p>
+            )}
+          </div>
+        )}
 
         <Section title={f.tipo === "entrega" ? "Horário de entrega" : "Horário para servir"}>
           <div className="flex flex-wrap gap-2 mb-2">
@@ -421,7 +507,11 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
 
       <div className="sticky bottom-0 border-t border-slate-200 p-3" style={{ backgroundColor: "#f1f5f9" }}>
         {editId && <p className="text-center text-xs font-bold text-amber-600 mb-1">✏️ Editando pedido enviado — as alterações vão para a cozinha</p>}
-        {!canSubmit && <p className="text-center text-xs text-slate-400 mb-1">Informe o nome para enviar</p>}
+        {!canSubmit && (
+          <p className="text-center text-xs text-slate-400 mb-1">
+            {f.nome.trim().length === 0 ? "Informe o nome para enviar" : "Informe o endereço da entrega"}
+          </p>
+        )}
         <button onClick={submit} disabled={!canSubmit}
           className={"w-full rounded-2xl font-extrabold text-lg flex items-center justify-center gap-2 " + (canSubmit ? (editId ? "bg-amber-600 text-white active:bg-amber-700" : "bg-green-600 text-white active:bg-green-700") : "bg-slate-300 text-slate-500")} style={{ minHeight: "60px" }}>
           {editId ? <><Check size={22} /> Salvar alterações</> : <><Send size={22} /> Enviar para Cozinha</>}
@@ -441,7 +531,7 @@ function AtendenteView({ orders, menu, prefill, formSeed, nowTs, headerH, onCrea
 
   useEffect(() => { if (prefill) setSub("novo"); }, [formSeed]); // eslint-disable-line
 
-  const activeCount = orders.filter((o) => ["na_fila", "preparando", "pulado"].includes(o.status)).length;
+  const activeCount = orders.filter((o) => ["na_fila", "preparando", "pulado", "aguardando_entrega", "em_rota"].includes(o.status)).length;
   const recent = [...orders].sort((a, b) => b.createdAt - a.createdAt);
   const groups = groupByClient(recent);
 
@@ -489,6 +579,19 @@ function AtendenteView({ orders, menu, prefill, formSeed, nowTs, headerH, onCrea
                     )}
                   </div>
 
+                  {o.tipo === "entrega" && enderecoCompleto(o) && (
+                    <p className="mt-2 text-xs text-slate-500 flex items-start gap-1">
+                      <MapPin size={13} className="mt-0.5 shrink-0" /> {enderecoCompleto(o)}
+                    </p>
+                  )}
+
+                  {isEntregaAtiva(o) && (
+                    <div className={"mt-2 rounded-xl px-3 py-2 text-sm font-bold flex items-center gap-2 " + (o.status === "em_rota" ? "bg-purple-600 text-white" : "bg-purple-100 text-purple-800 border-2 border-purple-300")}>
+                      <Bike size={16} className="shrink-0" />
+                      {o.status === "em_rota" ? "Entregador saiu para entrega" : "Pronto — enviado ao entregador"}
+                    </div>
+                  )}
+
                   <p className={"mt-2 text-sm " + (o.status === "cancelado" ? "line-through text-slate-400" : "text-slate-600")}>{flatSummary(o)}</p>
                   {o.observacoes.trim() && (
                     <p className="mt-1 text-sm text-red-600 flex items-start gap-1"><AlertTriangle size={14} className="mt-0.5 shrink-0" /> {o.observacoes}</p>
@@ -530,8 +633,10 @@ function AtendenteView({ orders, menu, prefill, formSeed, nowTs, headerH, onCrea
 /*  Card + Visão Cozinha                                               */
 /* ================================================================== */
 
-function KitchenCard({ order, nowTs, variant, highlight, onPrepare, onComplete, onSkip, onBackToQueue }) {
+function KitchenCard({ order, nowTs, variant, highlight, onPrepare, onComplete, onSkip, onBackToQueue, onSendToDelivery }) {
   const preparing = order.status === "preparando";
+  const comBebida = temBebida(order);
+  const paraEntrega = order.tipo === "entrega";
   const isNew = variant === "fila" && nowTs - order.createdAt < 20000;
   const hInfo = horarioInfo(order, nowTs);
   const urgente = variant === "fila" && hInfo && hInfo.level === "urgente";
@@ -567,6 +672,11 @@ function KitchenCard({ order, nowTs, variant, highlight, onPrepare, onComplete, 
           {isNew && <span className="rounded-full bg-emerald-500 text-white text-xs font-bold px-2 py-0.5 animate-pulse">NOVO</span>}
           {order.edited && <span className="rounded-full bg-amber-100 text-amber-800 text-xs font-bold px-2 py-0.5">EDITADO</span>}
           {preparing && <span className="rounded-full bg-blue-100 text-blue-700 text-xs font-bold px-2 py-0.5">EM PREPARO</span>}
+          {comBebida && (
+            <span className="rounded-full bg-cyan-600 text-white text-xs font-extrabold px-2 py-0.5 flex items-center gap-1 animate-pulse">
+              <Coffee size={12} /> BEBIDA
+            </span>
+          )}
         </div>
       </div>
 
@@ -575,18 +685,41 @@ function KitchenCard({ order, nowTs, variant, highlight, onPrepare, onComplete, 
         <HorarioBadge info={hInfo} tipo={order.tipo} />
       </div>
 
+      {paraEntrega && enderecoCompleto(order) && (
+        <div className="mb-3 rounded-xl bg-indigo-50 border-2 border-indigo-200 px-3 py-2 text-sm text-indigo-900 flex items-start gap-2">
+          <MapPin size={16} className="mt-0.5 shrink-0" /> <span className="font-semibold">{enderecoCompleto(order)}</span>
+        </div>
+      )}
+
       <div className="space-y-3">
         {order.itens.length ? (
-          order.itens.map((g, i) => (
-            <div key={i}>
-              <div className="text-xs font-bold uppercase tracking-wide text-slate-400 mb-1">{g.categoria}</div>
-              <div className="flex flex-wrap gap-2">
-                {g.valores.map((t, j) => (
-                  <span key={j} className={"rounded-lg px-3 py-1.5 text-base font-semibold " + (g.destaque ? "bg-orange-600 text-white" : "bg-slate-800 text-white")}>{t}</span>
-                ))}
+          order.itens.map((g, i) => {
+            const beb = isBebidaCat(g.categoria);
+            if (beb) {
+              return (
+                <div key={i} className="rounded-xl border-4 border-cyan-500 bg-cyan-50 p-2.5 animate-pulse">
+                  <div className="text-xs font-extrabold uppercase tracking-wide text-cyan-800 mb-1 flex items-center gap-1">
+                    <Coffee size={14} /> {g.categoria} — NÃO ESQUEÇA!
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {g.valores.map((t, j) => (
+                      <span key={j} className="rounded-lg px-3 py-1.5 text-base font-extrabold bg-cyan-600 text-white">🥤 {t}</span>
+                    ))}
+                  </div>
+                </div>
+              );
+            }
+            return (
+              <div key={i}>
+                <div className="text-xs font-bold uppercase tracking-wide text-slate-400 mb-1">{g.categoria}</div>
+                <div className="flex flex-wrap gap-2">
+                  {g.valores.map((t, j) => (
+                    <span key={j} className={"rounded-lg px-3 py-1.5 text-base font-semibold " + (g.destaque ? "bg-orange-600 text-white" : "bg-slate-800 text-white")}>{t}</span>
+                  ))}
+                </div>
               </div>
-            </div>
-          ))
+            );
+          })
         ) : (
           <p className="text-slate-400 text-sm">Nenhum item marcado.</p>
         )}
@@ -611,9 +744,15 @@ function KitchenCard({ order, nowTs, variant, highlight, onPrepare, onComplete, 
                 <SkipForward size={20} /> Pular
               </button>
             </div>
-            <button onClick={() => onComplete(order.id)} className="w-full rounded-xl font-extrabold text-lg bg-green-600 text-white flex items-center justify-center gap-2 active:bg-green-700" style={{ minHeight: "58px" }}>
-              <CheckCircle2 size={22} /> CONCLUÍDO
-            </button>
+            {paraEntrega ? (
+              <button onClick={() => onSendToDelivery && onSendToDelivery(order.id)} className="w-full rounded-xl font-extrabold text-lg bg-purple-600 text-white flex items-center justify-center gap-2 active:bg-purple-700" style={{ minHeight: "58px" }}>
+                <Bike size={22} /> PRONTO → ENVIAR AO ENTREGADOR
+              </button>
+            ) : (
+              <button onClick={() => onComplete(order.id)} className="w-full rounded-xl font-extrabold text-lg bg-green-600 text-white flex items-center justify-center gap-2 active:bg-green-700" style={{ minHeight: "58px" }}>
+                <CheckCircle2 size={22} /> CONCLUÍDO
+              </button>
+            )}
           </div>
         )}
         {variant === "pulado" && (
@@ -627,9 +766,15 @@ function KitchenCard({ order, nowTs, variant, highlight, onPrepare, onComplete, 
               <button onClick={() => onBackToQueue(order.id)} className="rounded-xl font-bold bg-slate-200 text-slate-800 flex items-center justify-center gap-2 active:bg-slate-300" style={{ minHeight: "56px" }}>
                 <RotateCcw size={20} /> Voltar p/ Fila
               </button>
-              <button onClick={() => onComplete(order.id)} className="rounded-xl font-extrabold bg-green-600 text-white flex items-center justify-center gap-2 active:bg-green-700" style={{ minHeight: "56px" }}>
-                <CheckCircle2 size={20} /> Concluído
-              </button>
+              {paraEntrega ? (
+                <button onClick={() => onSendToDelivery && onSendToDelivery(order.id)} className="rounded-xl font-extrabold bg-purple-600 text-white flex items-center justify-center gap-2 active:bg-purple-700" style={{ minHeight: "56px" }}>
+                  <Bike size={20} /> Ao entregador
+                </button>
+              ) : (
+                <button onClick={() => onComplete(order.id)} className="rounded-xl font-extrabold bg-green-600 text-white flex items-center justify-center gap-2 active:bg-green-700" style={{ minHeight: "56px" }}>
+                  <CheckCircle2 size={20} /> Concluído
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -657,6 +802,7 @@ function gerarRelatorioPDF(entregues) {
       <td class="c">${o.tipo === "entrega" ? "🚲 Entrega" : "🏠 Local"}</td>
       <td class="c">${o.horario ? esc(o.horario) : "—"}</td>
       <td>${esc(flatSummary(o))}</td>
+      <td class="end">${o.tipo === "entrega" ? esc(enderecoCompleto(o)) : "—"}</td>
       <td class="obs">${esc(o.observacoes || "")}</td>
       <td class="c">${fmtHM(o.completedAt)}</td>
     </tr>`).join("");
@@ -671,7 +817,7 @@ function gerarRelatorioPDF(entregues) {
       table{width:100%;border-collapse:collapse;font-size:13px}
       th,td{border:1px solid #e2e8f0;padding:7px 9px;text-align:left;vertical-align:top}
       th{background:#f1f5f9;font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:#475569}
-      td.c{text-align:center;white-space:nowrap} td.obs{color:#b91c1c}
+      td.c{text-align:center;white-space:nowrap} td.obs{color:#b91c1c} td.end{color:#3730a3;font-size:12px}
       tr:nth-child(even) td{background:#fafafa}
       .print{margin-top:18px;padding:12px 18px;border:0;border-radius:10px;background:#059669;color:#fff;font-weight:700;font-size:15px;cursor:pointer}
       @media print{.print{display:none}body{margin:0}}
@@ -683,8 +829,8 @@ function gerarRelatorioPDF(entregues) {
       <div class="kpi"><b>${totalLocal}</b><span>No local</span></div>
       <div class="kpi"><b>${totalEntrega}</b><span>Entregas</span></div>
     </div>
-    <table><thead><tr><th>#</th><th>Cliente</th><th>Tipo</th><th>Horário</th><th>Itens</th><th>Observações</th><th>Concluído</th></tr></thead>
-    <tbody>${trs || '<tr><td colspan="7" class="c">Nenhum pedido.</td></tr>'}</tbody></table>
+    <table><thead><tr><th>#</th><th>Cliente</th><th>Tipo</th><th>Horário</th><th>Itens</th><th>Endereço</th><th>Observações</th><th>Concluído</th></tr></thead>
+    <tbody>${trs || '<tr><td colspan="8" class="c">Nenhum pedido.</td></tr>'}</tbody></table>
     <button class="print" onclick="window.print()">🖨️ Imprimir / Salvar como PDF</button>
     <script>window.onload=function(){setTimeout(function(){window.print();},400);};</script>
     </body></html>`;
@@ -693,13 +839,66 @@ function gerarRelatorioPDF(entregues) {
   w.document.open(); w.document.write(html); w.document.close();
 }
 
-function CozinhaView({ orders, nowTs, headerH, onPrepare, onComplete, onSkip, onBackToQueue, onClearHistory }) {
+/* Popup que lembra a bebida antes de concluir / enviar ao entregador */
+function BebidaModal({ pending, onConfirm, onCancel }) {
+  if (!pending) return null;
+  const { order, acao } = pending;
+  const bebidas = bebidasDoPedido(order);
+  const entrega = acao === "entregador";
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: "rgba(0,0,0,0.55)" }}>
+      <div className="w-full rounded-2xl bg-white p-5 shadow-xl" style={{ maxWidth: "420px" }}>
+        <div className="flex items-center gap-2 text-cyan-700 font-extrabold text-lg">
+          <Coffee size={24} /> Não esqueça a bebida!
+        </div>
+        <p className="text-sm text-slate-600 mt-1">
+          O pedido de <b>{order.nome}</b> tem bebida. Confira antes de {entrega ? "enviar ao entregador" : "concluir"}:
+        </p>
+        <div className="mt-3 rounded-xl border-4 border-cyan-500 bg-cyan-50 p-3 flex flex-wrap gap-2">
+          {bebidas.map((b, i) => (
+            <span key={i} className="rounded-lg bg-cyan-600 text-white px-3 py-1.5 font-extrabold">🥤 {b}</span>
+          ))}
+        </div>
+        <div className="mt-4 grid grid-cols-2 gap-2">
+          <button onClick={onCancel} className="rounded-xl bg-slate-200 text-slate-700 font-bold" style={{ minHeight: "54px" }}>
+            Ainda não
+          </button>
+          <button onClick={onConfirm} className={"rounded-xl text-white font-extrabold flex items-center justify-center gap-2 " + (entrega ? "bg-purple-600 active:bg-purple-700" : "bg-green-600 active:bg-green-700")} style={{ minHeight: "54px" }}>
+            {entrega ? <><Bike size={20} /> Bebida ok, enviar</> : <><CheckCircle2 size={20} /> Bebida ok, concluir</>}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CozinhaView({ orders, nowTs, headerH, onPrepare, onComplete, onSkip, onBackToQueue, onClearHistory, onSendToDelivery }) {
   const [tab, setTab] = useState("fila");
   const [highlightId, setHighlightId] = useState(null);
+  const [pendingBebida, setPendingBebida] = useState(null);
+
+  /* Se o pedido tiver bebida, pede confirmação antes de sair da cozinha. */
+  const guardBebida = (acao) => (id) => {
+    const o = orders.find((x) => x.id === id);
+    if (o && temBebida(o)) { setPendingBebida({ order: o, acao }); return; }
+    if (acao === "entregador") onSendToDelivery(id); else onComplete(id);
+  };
+  const completeGuard = guardBebida("concluir");
+  const deliveryGuard = guardBebida("entregador");
+  const confirmBebida = () => {
+    const p = pendingBebida;
+    setPendingBebida(null);
+    if (!p) return;
+    if (p.acao === "entregador") onSendToDelivery(p.order.id); else onComplete(p.order.id);
+  };
 
   const fila = orders.filter((o) => o.status === "na_fila" || o.status === "preparando").sort((a, b) => targetTs(a, nowTs) - targetTs(b, nowTs));
   const pulados = orders.filter((o) => o.status === "pulado").sort((a, b) => (a.skippedAt || a.createdAt) - (b.skippedAt || b.createdAt));
-  const entregues = orders.filter((o) => o.status === "concluido").sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0));
+  const concluidos = orders.filter((o) => o.status === "concluido").sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0));
+  /* A cozinha continua vendo o pedido depois de enviá-lo ao entregador. */
+  const entregues = orders
+    .filter((o) => o.status === "concluido" || isEntregaAtiva(o))
+    .sort((a, b) => (b.completedAt || b.outAt || b.readyAt || 0) - (a.completedAt || a.outAt || a.readyAt || 0));
 
   const filaGroups = groupByClient(fila);
   const alertas = fila.filter((o) => { const h = horarioInfo(o, nowTs); return h && h.level === "urgente"; });
@@ -755,37 +954,227 @@ function CozinhaView({ orders, nowTs, headerH, onPrepare, onComplete, onSkip, on
                 <span className="rounded-lg bg-slate-900 text-white px-3 py-1 font-extrabold">{g.nome}</span>
                 <span className="text-xs font-bold text-slate-500">{g.items.length} pedidos deste cliente</span>
               </div>
-              {g.items.map((o) => <KitchenCard key={o.id} order={o} nowTs={nowTs} variant="fila" highlight={highlightId === o.id} onPrepare={onPrepare} onComplete={onComplete} onSkip={onSkip} />)}
+              {g.items.map((o) => <KitchenCard key={o.id} order={o} nowTs={nowTs} variant="fila" highlight={highlightId === o.id} onPrepare={onPrepare} onComplete={completeGuard} onSkip={onSkip} onSendToDelivery={deliveryGuard} />)}
             </div>
           ) : (
-            <KitchenCard key={g.items[0].id} order={g.items[0]} nowTs={nowTs} variant="fila" highlight={highlightId === g.items[0].id} onPrepare={onPrepare} onComplete={onComplete} onSkip={onSkip} />
+            <KitchenCard key={g.items[0].id} order={g.items[0]} nowTs={nowTs} variant="fila" highlight={highlightId === g.items[0].id} onPrepare={onPrepare} onComplete={completeGuard} onSkip={onSkip} onSendToDelivery={deliveryGuard} />
           )
         )) : <Empty>Nenhum pedido na fila. Tudo em dia! 🎉</Empty>)}
 
-        {tab === "pulados" && (pulados.length ? pulados.map((o) => <KitchenCard key={o.id} order={o} nowTs={nowTs} variant="pulado" onComplete={onComplete} onBackToQueue={onBackToQueue} />) : <Empty>Nenhum pedido aguardando.</Empty>)}
+        {tab === "pulados" && (pulados.length ? pulados.map((o) => <KitchenCard key={o.id} order={o} nowTs={nowTs} variant="pulado" onComplete={completeGuard} onBackToQueue={onBackToQueue} onSendToDelivery={deliveryGuard} />) : <Empty>Nenhum pedido aguardando.</Empty>)}
 
         {tab === "entregues" && (entregues.length ? (
           <>
-            <button onClick={() => gerarRelatorioPDF(entregues)} className="w-full rounded-xl bg-slate-900 text-white font-bold flex items-center justify-center gap-2" style={{ minHeight: "50px" }}>
+            <button onClick={() => gerarRelatorioPDF(concluidos)} className="w-full rounded-xl bg-slate-900 text-white font-bold flex items-center justify-center gap-2" style={{ minHeight: "50px" }}>
               <ClipboardList size={18} /> Gerar relatório (PDF)
             </button>
-            {entregues.map((o) => (
-              <div key={o.id} className="rounded-2xl border-2 border-slate-200 bg-white p-4">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="rounded-lg bg-green-600 text-white px-3 py-1 font-extrabold text-lg flex items-center gap-1 truncate" style={{ maxWidth: "200px" }}>
-                    <CheckCircle2 size={18} /> {o.nome}
+            {entregues.map((o) => {
+              const emEntrega = isEntregaAtiva(o);
+              return (
+                <div key={o.id} className={"rounded-2xl border-2 bg-white p-4 " + (emEntrega ? "border-purple-300" : "border-slate-200")}>
+                  <div className="flex items-center justify-between gap-2">
+                    <div className={"rounded-lg text-white px-3 py-1 font-extrabold text-lg flex items-center gap-1 truncate " + (emEntrega ? "bg-purple-600" : "bg-green-600")} style={{ maxWidth: "200px" }}>
+                      {emEntrega ? <Bike size={18} /> : <CheckCircle2 size={18} />} {o.nome}
+                    </div>
+                    <div className="text-xs text-slate-400 shrink-0">
+                      {emEntrega ? relTime(o.outAt || o.readyAt || o.createdAt, nowTs) : `Entregue ${relTime(o.completedAt || o.createdAt, nowTs)}`}
+                    </div>
                   </div>
-                  <div className="text-xs text-slate-400 shrink-0">Entregue {relTime(o.completedAt || o.createdAt, nowTs)}</div>
+                  <div className="mt-2 flex flex-wrap gap-2 items-center">
+                    <TipoBadge tipo={o.tipo} size="sm" />
+                    {emEntrega && (
+                      <span className={"rounded-full text-xs font-bold px-2 py-0.5 " + (o.status === "em_rota" ? "bg-purple-600 text-white" : "bg-purple-100 text-purple-800")}>
+                        {o.status === "em_rota" ? "SAIU PARA ENTREGA" : "COM O ENTREGADOR"}
+                      </span>
+                    )}
+                    {temBebida(o) && <span className="rounded-full bg-cyan-600 text-white text-xs font-bold px-2 py-0.5">🥤 COM BEBIDA</span>}
+                  </div>
+                  <p className="mt-2 text-sm text-slate-600">{flatSummary(o)}</p>
                 </div>
-                <div className="mt-2"><TipoBadge tipo={o.tipo} size="sm" /></div>
-                <p className="mt-2 text-sm text-slate-600">{flatSummary(o)}</p>
-              </div>
-            ))}
+              );
+            })}
             <button onClick={onClearHistory} className="w-full rounded-xl border-2 border-slate-200 text-slate-500 font-bold flex items-center justify-center gap-2" style={{ minHeight: "46px" }}>
               <Trash2 size={16} /> Limpar histórico
             </button>
           </>
         ) : <Empty>Nenhum prato entregue ainda.</Empty>)}
+      </div>
+
+      <BebidaModal pending={pendingBebida} onConfirm={confirmBebida} onCancel={() => setPendingBebida(null)} />
+    </div>
+  );
+}
+
+/* ================================================================== */
+/*  Visão Entregador                                                   */
+/* ================================================================== */
+
+function EntregaCard({ order, nowTs, variant, onStartRoute, onDelivered, onBackToKitchen, onCopied }) {
+  const hInfo = horarioInfo(order, nowTs);
+  const urgente = hInfo && hInfo.level === "urgente";
+  const emRota = order.status === "em_rota";
+  const comBebida = temBebida(order);
+  const end = (order.endereco || "").trim();
+  const [confirmVolta, setConfirmVolta] = useState(false);
+
+  const tone = variant === "entregue"
+    ? "border-slate-200 bg-white"
+    : urgente ? "border-red-500 bg-red-50"
+    : emRota ? "border-purple-500 bg-purple-50"
+    : "border-slate-200 bg-white";
+
+  return (
+    <div id={"entrega-" + order.id} className={"rounded-2xl border-2 p-4 shadow-sm " + tone}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-xs font-medium text-slate-400 leading-none mb-0.5">ENTREGAR PARA</div>
+          <div className="text-2xl font-extrabold text-slate-900 leading-tight break-words">{order.nome}</div>
+        </div>
+        <div className="flex flex-col items-end gap-1 shrink-0">
+          {emRota && <span className="rounded-full bg-purple-600 text-white text-xs font-bold px-2 py-0.5">EM ROTA</span>}
+          {variant === "entregue" && <span className="rounded-full bg-green-600 text-white text-xs font-bold px-2 py-0.5">ENTREGUE</span>}
+          {comBebida && variant !== "entregue" && (
+            <span className="rounded-full bg-cyan-600 text-white text-xs font-extrabold px-2 py-0.5 flex items-center gap-1 animate-pulse">
+              <Coffee size={12} /> BEBIDA
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className="mt-2 flex flex-wrap gap-2">
+        <HorarioBadge info={hInfo} tipo="entrega" />
+        {order.readyAt && variant !== "entregue" && (
+          <span className="rounded-lg bg-slate-100 text-slate-600 text-sm font-semibold px-3 py-1.5 flex items-center gap-1">
+            <Clock size={14} /> pronto {relTime(order.readyAt, nowTs)}
+          </span>
+        )}
+      </div>
+
+      <div className="mt-3 rounded-xl border-2 border-indigo-300 bg-indigo-50 p-3">
+        <div className="flex items-center gap-1 text-xs font-bold uppercase tracking-wide text-indigo-700 mb-1">
+          <MapPin size={14} /> Endereço
+        </div>
+        <p className="text-lg font-bold text-slate-900 leading-snug break-words">{end || "— endereço não informado —"}</p>
+        {(order.referencia || "").trim() && (
+          <p className="text-sm text-indigo-800 mt-1"><b>Referência:</b> {order.referencia}</p>
+        )}
+      </div>
+
+      {variant !== "entregue" && end && (
+        <div className="mt-2 grid grid-cols-3 gap-2">
+          <a href={mapsUrl(order)} target="_blank" rel="noopener noreferrer"
+            className="rounded-xl bg-emerald-600 text-white font-bold text-sm flex items-center justify-center gap-1 active:bg-emerald-700" style={{ minHeight: "50px" }}>
+            <Navigation size={16} /> Maps
+          </a>
+          <a href={wazeUrl(order)} target="_blank" rel="noopener noreferrer"
+            className="rounded-xl bg-sky-600 text-white font-bold text-sm flex items-center justify-center gap-1 active:bg-sky-700" style={{ minHeight: "50px" }}>
+            <Navigation size={16} /> Waze
+          </a>
+          <button onClick={() => copiarTexto(enderecoCompleto(order), onCopied)}
+            className="rounded-xl border-2 border-slate-300 text-slate-700 font-bold text-sm flex items-center justify-center gap-1" style={{ minHeight: "50px" }}>
+            <Copy size={16} /> Copiar
+          </button>
+        </div>
+      )}
+
+      <div className="mt-3 space-y-3">
+        {order.itens.length ? order.itens.map((g, i) => {
+          const beb = isBebidaCat(g.categoria);
+          return (
+            <div key={i} className={beb && variant !== "entregue" ? "rounded-xl border-4 border-cyan-500 bg-cyan-50 p-2.5 animate-pulse" : ""}>
+              <div className={"text-xs font-bold uppercase tracking-wide mb-1 flex items-center gap-1 " + (beb ? "text-cyan-800" : "text-slate-400")}>
+                {beb && <Coffee size={14} />} {g.categoria}{beb && variant !== "entregue" ? " — CONFIRA!" : ""}
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {g.valores.map((t, j) => (
+                  <span key={j} className={"rounded-lg px-3 py-1.5 font-semibold " + (beb ? "bg-cyan-600 text-white font-extrabold" : g.destaque ? "bg-orange-600 text-white" : "bg-slate-800 text-white")}>
+                    {beb ? "🥤 " : ""}{t}
+                  </span>
+                ))}
+              </div>
+            </div>
+          );
+        }) : <p className="text-slate-400 text-sm">Nenhum item marcado.</p>}
+      </div>
+
+      {(order.observacoes || "").trim() && (
+        <div className="mt-3 rounded-xl border-2 border-red-500 bg-red-50 p-3">
+          <div className="flex items-center gap-2 text-red-700 font-bold text-sm mb-1"><AlertTriangle size={18} /> OBSERVAÇÃO</div>
+          <p className="text-red-800 font-semibold">{order.observacoes}</p>
+        </div>
+      )}
+
+      {variant !== "entregue" && (
+        <div className="mt-4 space-y-2">
+          {!emRota ? (
+            <button onClick={() => onStartRoute(order.id)} className="w-full rounded-xl font-extrabold text-lg bg-purple-600 text-white flex items-center justify-center gap-2 active:bg-purple-700" style={{ minHeight: "58px" }}>
+              <Bike size={22} /> SAIR PARA ENTREGA
+            </button>
+          ) : (
+            <button onClick={() => onDelivered(order.id)} className="w-full rounded-xl font-extrabold text-lg bg-green-600 text-white flex items-center justify-center gap-2 active:bg-green-700" style={{ minHeight: "58px" }}>
+              <CheckCircle2 size={22} /> ENTREGUE AO CLIENTE
+            </button>
+          )}
+          {confirmVolta ? (
+            <div className="flex gap-2">
+              <button onClick={() => { onBackToKitchen(order.id); setConfirmVolta(false); }} className="flex-1 rounded-xl bg-amber-600 text-white font-bold" style={{ minHeight: "46px" }}>Sim, devolver</button>
+              <button onClick={() => setConfirmVolta(false)} className="flex-1 rounded-xl bg-slate-200 text-slate-700 font-bold" style={{ minHeight: "46px" }}>Não</button>
+            </div>
+          ) : (
+            <button onClick={() => setConfirmVolta(true)} className="w-full rounded-xl border-2 border-slate-300 text-slate-500 font-semibold text-sm" style={{ minHeight: "44px" }}>
+              <RotateCcw size={14} className="inline mr-1" /> Devolver para a cozinha
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EntregadorView({ orders, nowTs, headerH, onStartRoute, onDelivered, onBackToKitchen, onCopied }) {
+  const [tab, setTab] = useState("aguardando");
+
+  const aguardando = orders.filter((o) => o.status === "aguardando_entrega").sort((a, b) => targetTs(a, nowTs) - targetTs(b, nowTs));
+  const emRota = orders.filter((o) => o.status === "em_rota").sort((a, b) => (a.outAt || 0) - (b.outAt || 0));
+  const entregues = orders.filter((o) => o.status === "concluido" && o.tipo === "entrega").sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0));
+
+  /* Ao sair para entregar, leva o entregador direto para a aba "Em rota",
+     senão ele ficaria olhando uma lista vazia. */
+  const startRoute = (id) => { onStartRoute(id); setTab("rota"); };
+
+  const lista = tab === "aguardando" ? aguardando : tab === "rota" ? emRota : entregues;
+  const vazio = tab === "aguardando" ? "Nenhuma entrega pronta no momento."
+    : tab === "rota" ? "Você não está com nenhuma entrega em rota."
+    : "Nenhuma entrega concluída ainda.";
+
+  /* Todos os endereços pendentes, para montar uma rota única no Maps */
+  const pendentes = [...emRota, ...aguardando].filter((o) => (o.endereco || "").trim());
+  const rotaGeralUrl = pendentes.length > 1
+    ? `https://www.google.com/maps/dir/?api=1&travelmode=driving&destination=${encodeURIComponent(pendentes[pendentes.length - 1].endereco.trim())}&waypoints=${pendentes.slice(0, -1).map((o) => encodeURIComponent(o.endereco.trim())).join("%7C")}`
+    : null;
+
+  return (
+    <div>
+      <div className="sticky z-20 px-3 py-3" style={{ top: headerH, backgroundColor: "#f1f5f9" }}>
+        <div className="grid grid-cols-3 gap-1 bg-slate-200 rounded-xl p-1">
+          <Tab active={tab === "aguardando"} onClick={() => setTab("aguardando")} count={aguardando.length}>Prontas</Tab>
+          <Tab active={tab === "rota"} onClick={() => setTab("rota")} count={emRota.length}>Em rota</Tab>
+          <Tab active={tab === "entregues"} onClick={() => setTab("entregues")} count={entregues.length}>Entregues</Tab>
+        </div>
+      </div>
+
+      <div className="p-4 space-y-4">
+        {tab !== "entregues" && rotaGeralUrl && (
+          <a href={rotaGeralUrl} target="_blank" rel="noopener noreferrer"
+            className="w-full rounded-xl bg-slate-900 text-white font-bold flex items-center justify-center gap-2" style={{ minHeight: "50px" }}>
+            <Navigation size={18} /> Rota com as {pendentes.length} entregas (Maps)
+          </a>
+        )}
+
+        {lista.length === 0 ? <Empty>{vazio}</Empty> : lista.map((o) => (
+          <EntregaCard key={o.id} order={o} nowTs={nowTs} variant={tab === "entregues" ? "entregue" : "ativa"}
+            onStartRoute={startRoute} onDelivered={onDelivered} onBackToKitchen={onBackToKitchen} onCopied={onCopied} />
+        ))}
       </div>
     </div>
   );
@@ -925,13 +1314,17 @@ function AdminView({ menus, activeMenuId, onCreateMenu, onSaveMenu, onDeleteMenu
 /*  Chat + Toasts                                                      */
 /* ================================================================== */
 
+const ROLE_LABEL = { cozinha: "Cozinha", entregador: "Entregador", atendente: "Atendente" };
+
 function ChatDrawer({ open, onClose, messages, role, onSend }) {
   const [text, setText] = useState("");
   const listRef = useRef(null);
   useEffect(() => { if (open && listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight; }, [open, messages]);
   if (!open) return null;
 
-  const presets = ["Acabou a farofa", "Sem batata frita no momento", "Prato pronto para servir", "Cliente desistiu de um item"];
+  const presets = role === "entregador"
+    ? ["Saindo para a entrega", "Cliente não atendeu", "Endereço não encontrado", "Voltando para buscar mais pedidos"]
+    : ["Acabou a farofa", "Sem batata frita no momento", "Prato pronto para servir", "Cliente desistiu de um item"];
   const send = () => { if (text.trim()) { onSend(text); setText(""); } };
 
   return (
@@ -939,7 +1332,7 @@ function ChatDrawer({ open, onClose, messages, role, onSend }) {
       <div className="flex-1" style={{ backgroundColor: "rgba(0,0,0,0.45)" }} onClick={onClose} />
       <div className="w-full bg-white h-full flex flex-col shadow-xl" style={{ maxWidth: "420px" }}>
         <div className="flex items-center justify-between border-b border-slate-200 p-4">
-          <div className="flex items-center gap-2 font-bold text-slate-800"><MessageSquare size={20} /> Chat · Salão ⇄ Cozinha</div>
+          <div className="flex items-center gap-2 font-bold text-slate-800"><MessageSquare size={20} /> Chat · Salão ⇄ Cozinha ⇄ Entrega</div>
           <button onClick={onClose} className="rounded-lg p-2 text-slate-500 active:bg-slate-100"><X size={22} /></button>
         </div>
         <div ref={listRef} className="flex-1 overflow-y-auto p-4 space-y-3">
@@ -949,7 +1342,7 @@ function ChatDrawer({ open, onClose, messages, role, onSend }) {
             return (
               <div key={m.id} className={"flex " + (mine ? "justify-end" : "justify-start")}>
                 <div className={"rounded-2xl px-4 py-2 " + (mine ? "bg-blue-600 text-white" : "bg-slate-100 text-slate-800")} style={{ maxWidth: "82%" }}>
-                  <div className={"text-xs font-bold mb-0.5 " + (mine ? "text-blue-100" : "text-slate-500")}>{m.sender === "cozinha" ? "Cozinha" : "Atendente"}</div>
+                  <div className={"text-xs font-bold mb-0.5 " + (mine ? "text-blue-100" : "text-slate-500")}>{ROLE_LABEL[m.sender] || "Atendente"}</div>
                   <div className="text-sm">{m.text}</div>
                 </div>
               </div>
@@ -964,7 +1357,7 @@ function ChatDrawer({ open, onClose, messages, role, onSend }) {
           </div>
           <div className="flex gap-2 items-end">
             <input value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") send(); }}
-              placeholder={`Escrever como ${role === "cozinha" ? "Cozinha" : "Atendente"}...`}
+              placeholder={`Escrever como ${ROLE_LABEL[role] || "Atendente"}...`}
               className="flex-1 rounded-xl border-2 border-slate-200 px-4 outline-none focus:border-blue-500" style={{ minHeight: "50px" }} />
             <button onClick={send} className="rounded-xl bg-blue-600 text-white px-4 flex items-center justify-center active:bg-blue-700" style={{ minHeight: "50px" }}><Send size={20} /></button>
           </div>
@@ -984,7 +1377,7 @@ function Toasts({ toasts, onUndo }) {
             <>
               <CheckCircle2 size={22} className="text-green-400 shrink-0" />
               <div className="flex-1 min-w-0">
-                <div className="font-bold truncate">Pedido de {t.nome} concluído</div>
+                <div className="font-bold truncate">Pedido de {t.nome} {t.message || "concluído"}</div>
                 <div className="mt-1 h-1 w-full rounded overflow-hidden" style={{ backgroundColor: "rgba(255,255,255,0.2)" }}>
                   <div className="h-full bg-green-400" style={{ animation: "undobar 5s linear forwards" }} />
                 </div>
@@ -1037,7 +1430,7 @@ function ComandaApp() {
   const [messages, setMessages] = useState([]);
   const [soundOn, setSoundOn] = useState(true);
   const [chatOpen, setChatOpen] = useState(false);
-  const [lastOpen, setLastOpen] = useState({ atendente: Date.now(), cozinha: Date.now() });
+  const [lastOpen, setLastOpen] = useState({ atendente: Date.now(), cozinha: Date.now(), entregador: Date.now() });
   const [toasts, setToasts] = useState([]);
   const [nowTs, setNowTs] = useState(Date.now());
   const [prefill, setPrefill] = useState(null);
@@ -1050,7 +1443,7 @@ function ComandaApp() {
   const headerRef = useRef(null);
   const [headerH, setHeaderH] = useState(0);
 
-  const role = view === "cozinha" ? "cozinha" : "atendente";
+  const role = view === "cozinha" ? "cozinha" : view === "entregador" ? "entregador" : "atendente";
   const roleRef = useRef(role); roleRef.current = role;
   const soundOnRef = useRef(soundOn); soundOnRef.current = soundOn;
 
@@ -1134,6 +1527,7 @@ function ComandaApp() {
             const o = orderFromRow(p.new); upsertOrder(o);
             if (p.eventType === "INSERT" && roleRef.current === "cozinha") dingNewOrder();
             if (p.eventType === "UPDATE" && p.new.status === "concluido" && (!p.old || p.old.status !== "concluido") && roleRef.current === "atendente") chimeDone();
+            if (p.eventType === "UPDATE" && p.new.status === "aguardando_entrega" && (!p.old || p.old.status !== "aguardando_entrega") && roleRef.current === "entregador") dingNewOrder();
           })
           .on("postgres_changes", { event: "*", schema: "public", table: "messages" }, (p) => {
             if (p.eventType !== "INSERT") return;
@@ -1176,6 +1570,7 @@ function ComandaApp() {
       pushToast({ type: "success", message: `Pedido de ${data.nome} atualizado`, duration: 2500 });
       supabase.from("orders").update({
         nome: data.nome, tipo: data.tipo, horario: data.horario, observacoes: data.observacoes,
+        endereco: data.endereco || "", referencia: data.referencia || "",
         itens: data.itens, selections: data.selections, edited: true,
       }).eq("id", editId).then(({ error }) => dbFail(error));
       return;
@@ -1217,10 +1612,34 @@ function ComandaApp() {
   };
   const undoComplete = (toast) => {
     const o = orders.find((x) => x.id === toast.orderId);
-    if (o) upsertOrder({ ...o, status: toast.prevStatus, completedAt: null });
+    const patch = { status: toast.prevStatus, completed_at: null };
+    if (toast.message) patch.ready_at = null; // desfazer envio ao entregador
+    if (o) upsertOrder({ ...o, status: toast.prevStatus, completedAt: null, readyAt: toast.message ? null : o.readyAt });
     removeToast(toast.id);
-    supabase.from("orders").update({ status: toast.prevStatus, completed_at: null }).eq("id", toast.orderId).then(({ error }) => dbFail(error));
+    supabase.from("orders").update(patch).eq("id", toast.orderId).then(({ error }) => dbFail(error));
   };
+  /* --- Fluxo de entrega ------------------------------------------- */
+  const sendToDelivery = (id) => {
+    const o = orders.find((x) => x.id === id); if (!o || o.status === "aguardando_entrega") return;
+    const prevStatus = o.status; const ts = Date.now();
+    upsertOrder({ ...o, status: "aguardando_entrega", readyAt: ts, skippedAt: null });
+    pushToast({ type: "undo", nome: o.nome, orderId: id, prevStatus, message: "enviado ao entregador", duration: 5000 });
+    supabase.from("orders").update({ status: "aguardando_entrega", ready_at: ts, skipped_at: null }).eq("id", id).then(({ error }) => dbFail(error));
+  };
+  const startRoute = (id) => {
+    const o = orders.find((x) => x.id === id); if (!o) return;
+    const ts = Date.now();
+    upsertOrder({ ...o, status: "em_rota", outAt: ts });
+    pushToast({ type: "success", message: `Saindo para entregar: ${o.nome}`, duration: 2500 });
+    supabase.from("orders").update({ status: "em_rota", out_at: ts }).eq("id", id).then(({ error }) => dbFail(error));
+  };
+  const backToKitchen = (id) => {
+    const o = orders.find((x) => x.id === id); if (!o) return;
+    upsertOrder({ ...o, status: "na_fila", readyAt: null, outAt: null });
+    pushToast({ type: "info", message: `Pedido de ${o.nome} devolvido à cozinha`, duration: 2500 });
+    supabase.from("orders").update({ status: "na_fila", ready_at: null, out_at: null }).eq("id", id).then(({ error }) => dbFail(error));
+  };
+
   const clearHistory = () => {
     const ids = orders.filter((o) => o.status === "concluido").map((o) => o.id);
     setOrders((prev) => prev.filter((o) => o.status !== "concluido"));
@@ -1228,12 +1647,12 @@ function ComandaApp() {
   };
 
   const repeatOrder = (order) => {
-    setPrefill({ mode: "repeat", tipo: order.tipo, horario: order.horario, observacoes: order.observacoes, selections: order.selections });
+    setPrefill({ mode: "repeat", tipo: order.tipo, horario: order.horario, observacoes: order.observacoes, endereco: order.endereco, referencia: order.referencia, selections: order.selections });
     setFormSeed((n) => n + 1);
     setView("atendente");
   };
   const editOrder = (order) => {
-    setPrefill({ mode: "edit", editId: order.id, nome: order.nome, tipo: order.tipo, horario: order.horario, observacoes: order.observacoes, selections: order.selections });
+    setPrefill({ mode: "edit", editId: order.id, nome: order.nome, tipo: order.tipo, horario: order.horario, observacoes: order.observacoes, endereco: order.endereco, referencia: order.referencia, selections: order.selections });
     setFormSeed((n) => n + 1);
     setView("atendente");
   };
@@ -1255,10 +1674,15 @@ function ComandaApp() {
     supabase.from("messages").insert(msgToRow(m)).then(({ error }) => dbFail(error));
   };
 
-  const navBtn = (target, icon, label) => (
+  const entregasPendentes = orders.filter((o) => isEntregaAtiva(o)).length;
+
+  const navBtn = (target, icon, label, count) => (
     <button onClick={() => setView(target)}
-      className={"rounded-lg font-bold flex items-center justify-center gap-2 " + (view === target ? "bg-white text-slate-900 shadow" : "text-slate-500")} style={{ minHeight: "46px" }}>
+      className={"rounded-lg font-bold flex items-center justify-center gap-1.5 text-sm " + (view === target ? "bg-white text-slate-900 shadow" : "text-slate-500")} style={{ minHeight: "46px" }}>
       {icon} {label}
+      {typeof count === "number" && count > 0 && (
+        <span className={"rounded-full text-xs px-1.5 " + (view === target ? "bg-purple-600 text-white" : "bg-purple-500 text-white")}>{count}</span>
+      )}
     </button>
   );
 
@@ -1287,9 +1711,10 @@ function ComandaApp() {
         </div>
 
         <div className="px-4 pb-3 max-w-xl mx-auto w-full">
-          <div className="grid grid-cols-2 gap-1 bg-slate-200 rounded-xl p-1">
+          <div className="grid grid-cols-3 gap-1 bg-slate-200 rounded-xl p-1">
             {navBtn("atendente", <User size={18} />, "Atendente")}
             {navBtn("cozinha", <ChefHat size={18} />, "Cozinha")}
+            {navBtn("entregador", <Bike size={18} />, "Entregador", entregasPendentes)}
           </div>
           {view === "admin" && <div className="mt-2 text-center text-xs font-semibold text-slate-500">Modo administração — toque em Atendente ou Cozinha para voltar</div>}
         </div>
@@ -1308,7 +1733,11 @@ function ComandaApp() {
                 onCreate={createOrder} onEdit={editOrder} onCancel={cancelOrder} onRepeat={repeatOrder} onConsumedPrefill={consumedPrefill} />
             ) : <div className="p-8"><Empty>Nenhum cardápio ativo. Vá em Administração.</Empty></div>)}
             {view === "cozinha" && (
-              <CozinhaView orders={orders} nowTs={nowTs} headerH={headerH} onPrepare={prepareToggle} onComplete={completeOrder} onSkip={skipOrder} onBackToQueue={backToQueue} onClearHistory={clearHistory} />
+              <CozinhaView orders={orders} nowTs={nowTs} headerH={headerH} onPrepare={prepareToggle} onComplete={completeOrder} onSkip={skipOrder} onBackToQueue={backToQueue} onClearHistory={clearHistory} onSendToDelivery={sendToDelivery} />
+            )}
+            {view === "entregador" && (
+              <EntregadorView orders={orders} nowTs={nowTs} headerH={headerH} onStartRoute={startRoute} onDelivered={completeOrder} onBackToKitchen={backToKitchen}
+                onCopied={() => pushToast({ type: "success", message: "Endereço copiado", duration: 1800 })} />
             )}
             {view === "admin" && (
               <AdminView menus={menus} activeMenuId={activeMenuId} onCreateMenu={createMenu} onSaveMenu={saveMenu} onDeleteMenu={deleteMenu} onSetActive={setActive} />
