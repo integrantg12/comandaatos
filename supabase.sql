@@ -26,12 +26,22 @@ create table if not exists orders (
   created_at int8 not null,
   completed_at int8,
   skipped_at int8,
-  edited boolean not null default false
+  edited boolean not null default false,
+  endereco text default '',
+  referencia text default '',
+  ready_at int8,
+  out_at int8
 );
 
 -- Migração (para bancos criados antes desta versão): adiciona as colunas novas.
 alter table orders add column if not exists skipped_at int8;
 alter table orders add column if not exists edited boolean not null default false;
+
+-- Migração da versão com ENTREGADOR:
+alter table orders add column if not exists endereco text default '';    -- endereço da entrega
+alter table orders add column if not exists referencia text default '';  -- ponto de referência
+alter table orders add column if not exists ready_at int8;               -- quando a cozinha enviou ao entregador
+alter table orders add column if not exists out_at int8;                 -- quando o entregador saiu para a rota
 
 create table if not exists messages (
   id text primary key,
