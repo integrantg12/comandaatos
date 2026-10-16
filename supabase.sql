@@ -30,7 +30,12 @@ create table if not exists orders (
   endereco text default '',
   referencia text default '',
   ready_at int8,
-  out_at int8
+  out_at int8,
+  pagamento text default '',
+  valor numeric,
+  forma_pagamento text default '',
+  troco_para numeric,
+  recebido_at int8
 );
 
 -- Migração (para bancos criados antes desta versão): adiciona as colunas novas.
@@ -42,6 +47,13 @@ alter table orders add column if not exists endereco text default '';    -- ende
 alter table orders add column if not exists referencia text default '';  -- ponto de referência
 alter table orders add column if not exists ready_at int8;               -- quando a cozinha enviou ao entregador
 alter table orders add column if not exists out_at int8;                 -- quando o entregador saiu para a rota
+
+-- Migração da versão com PAGAMENTO na entrega:
+alter table orders add column if not exists pagamento text default '';       -- 'pago' ou 'receber'
+alter table orders add column if not exists valor numeric;                   -- valor a receber
+alter table orders add column if not exists forma_pagamento text default ''; -- dinheiro, pix, cartao_debito, cartao_credito
+alter table orders add column if not exists troco_para numeric;              -- dinheiro: troco para quanto
+alter table orders add column if not exists recebido_at int8;                -- quando o entregador recebeu
 
 create table if not exists messages (
   id text primary key,
