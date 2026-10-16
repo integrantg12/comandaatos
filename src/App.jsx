@@ -3,7 +3,7 @@ import {
   Utensils, ChefHat, User, Settings, Volume2, VolumeX, MessageSquare, Send, X, Check,
   SkipForward, RotateCcw, CheckCircle2, AlertTriangle, Clock, Timer, Trash2, Undo2,
   ClipboardList, Plus, Bell, Copy, Home, Bike, Star, Save, WifiOff,
-  MapPin, Navigation, Coffee, Package,
+  MapPin, Navigation, Coffee, Package, Wallet, Banknote,
 } from "lucide-react";
 import { supabase, isConfigured } from "./supabaseClient";
 
@@ -87,6 +87,43 @@ const mapsUrl = (o) =>
   `https://www.google.com/maps/dir/?api=1&travelmode=driving&destination=${encodeURIComponent((o.endereco || "").trim())}`;
 const wazeUrl = (o) =>
   `https://www.waze.com/ul?navigate=yes&q=${encodeURIComponent((o.endereco || "").trim())}`;
+
+/* ---- Pagamento (entregas) ------------------------------------------
+   pagamento: "pago" (já pago, nada a cobrar) | "receber" (cobrar na entrega)
+   Para "receber": valor, forma e, se for dinheiro, "troco para" (opcional). */
+const FORMAS_PAGAMENTO = [
+  { id: "dinheiro", label: "Dinheiro" },
+  { id: "pix", label: "Pix" },
+  { id: "cartao_debito", label: "Cartão débito" },
+  { id: "cartao_credito", label: "Cartão crédito" },
+];
+const formaLabel = (id) => (FORMAS_PAGAMENTO.find((f) => f.id === id) || { label: "" }).label;
+
+/* Aceita "35", "35,50", "R$ 1.234,50" ou "35.50". Retorna null se inválido. */
+function parseValor(txt) {
+  let t = String(txt == null ? "" : txt).replace(/R\$|\s/g, "");
+  if (!t) return null;
+  if (t.includes(",")) t = t.replace(/\./g, "").replace(",", ".");
+  const n = Number(t);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n * 100) / 100 : null;
+}
+const fmtBRL = (n) => Number(n || 0).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+const valorParaInput = (n) => (n == null ? "" : Number(n).toFixed(2).replace(".", ","));
+
+const aReceber = (o) => o.tipo === "entrega" && o.pagamento === "receber" && o.valor > 0;
+const trocoDe = (o) => (aReceber(o) && o.formaPagamento === "dinheiro" && o.trocoPara > o.valor ? o.trocoPara - o.valor : 0);
+
+/* Texto curto do pagamento (cards do atendente e relatório). */
+function pagamentoResumo(o) {
+  if (o.tipo !== "entrega") return "";
+  if (o.pagamento === "pago") return "Já pago";
+  if (aReceber(o)) {
+    let t = `${o.recebidoAt ? "Recebido" : "Receber"} ${fmtBRL(o.valor)} · ${formaLabel(o.formaPagamento)}`;
+    if (trocoDe(o)) t += ` (troco p/ ${fmtBRL(o.trocoPara)})`;
+    return t;
+  }
+  return "Pagamento não informado";
+}
 
 function copiarTexto(txt, onOk) {
   const done = () => { if (onOk) onOk(); };
@@ -202,6 +239,9 @@ const orderFromRow = (r) => ({
   endereco: r.endereco || "", referencia: r.referencia || "",
   readyAt: r.ready_at != null ? Number(r.ready_at) : null,
   outAt: r.out_at != null ? Number(r.out_at) : null,
+  pagamento: r.pagamento || "", valor: r.valor != null ? Number(r.valor) : null,
+  formaPagamento: r.forma_pagamento || "", trocoPara: r.troco_para != null ? Number(r.troco_para) : null,
+  recebidoAt: r.recebido_at != null ? Number(r.recebido_at) : null,
 });
 const orderToRow = (o) => ({
   id: o.id, nome: o.nome, tipo: o.tipo, horario: o.horario || "", status: o.status,
@@ -211,6 +251,9 @@ const orderToRow = (o) => ({
   endereco: o.endereco || "", referencia: o.referencia || "",
   ready_at: o.readyAt != null ? o.readyAt : null,
   out_at: o.outAt != null ? o.outAt : null,
+  pagamento: o.pagamento || "", valor: o.valor != null ? o.valor : null,
+  forma_pagamento: o.formaPagamento || "", troco_para: o.trocoPara != null ? o.trocoPara : null,
+  recebido_at: o.recebidoAt != null ? o.recebidoAt : null,
 });
 const msgFromRow = (r) => ({ id: r.id, sender: r.sender, text: r.content, ts: Number(r.ts) });
 const msgToRow = (m) => ({ id: m.id, sender: m.sender, content: m.text, ts: m.ts });
@@ -329,6 +372,65 @@ function HorarioBadge({ info, tipo }) {
   );
 }
 
+/* Situação do pagamento da entrega.
+   size "lg" = bloco grande do entregador; "sm" = linha do atendente. */
+function PagamentoInfo({ order, size = "sm" }) {
+  if (order.tipo !== "entrega") return null;
+  const lg = size === "lg";
+  const receber = aReceber(order);
+  const troco = trocoDe(order);
+
+  if (!lg) {
+    const cls = order.pagamento === "pago" ? "bg-green-100 text-green-800"
+      : receber && order.recebidoAt ? "bg-green-600 text-white"
+      : receber ? "bg-amber-100 text-amber-900 border border-amber-300"
+      : "bg-slate-100 text-slate-500";
+    return (
+      <span className={"rounded-lg text-xs font-bold px-2 py-1 flex items-center gap-1 " + cls}>
+        <Wallet size={13} className="shrink-0" />
+        {receber && order.recebidoAt ? `Entregador recebeu ${fmtBRL(order.valor)} · ${formaLabel(order.formaPagamento)}` : pagamentoResumo(order)}
+      </span>
+    );
+  }
+
+  if (order.pagamento === "pago") {
+    return (
+      <div className="mt-3 rounded-xl border-4 border-green-500 bg-green-50 p-3 flex items-center gap-2">
+        <CheckCircle2 size={26} className="text-green-600 shrink-0" />
+        <div>
+          <div className="text-lg font-extrabold text-green-800 leading-tight">JÁ PAGO</div>
+          <div className="text-sm font-semibold text-green-700">Nada a cobrar do cliente</div>
+        </div>
+      </div>
+    );
+  }
+  if (receber) {
+    return (
+      <div className={"mt-3 rounded-xl border-4 p-3 " + (order.recebidoAt ? "border-green-500 bg-green-50" : "border-amber-500 bg-amber-50")}>
+        <div className={"flex items-center gap-1 text-xs font-extrabold uppercase tracking-wide " + (order.recebidoAt ? "text-green-800" : "text-amber-800")}>
+          <Banknote size={15} /> {order.recebidoAt ? `Recebido ${fmtHM(order.recebidoAt)}` : "Cobrar na entrega"}
+        </div>
+        <div className="flex items-end justify-between gap-2 flex-wrap mt-1">
+          <div className="text-3xl font-extrabold text-slate-900 leading-none">{fmtBRL(order.valor)}</div>
+          <span className="rounded-lg bg-slate-900 text-white text-sm font-bold px-3 py-1">{formaLabel(order.formaPagamento)}</span>
+        </div>
+        {order.formaPagamento === "dinheiro" && (
+          <p className="mt-2 text-sm font-semibold text-amber-900">
+            {troco > 0
+              ? <>Troco para {fmtBRL(order.trocoPara)} → <b>levar {fmtBRL(troco)} de troco</b></>
+              : "Não precisa de troco"}
+          </p>
+        )}
+      </div>
+    );
+  }
+  return (
+    <div className="mt-3 rounded-xl border-2 border-dashed border-slate-300 bg-slate-50 p-3 text-sm font-semibold text-slate-600 flex items-center gap-2">
+      <Wallet size={18} className="shrink-0" /> Pagamento não informado — confirme com o atendente
+    </div>
+  );
+}
+
 /* ================================================================== */
 /*  Formulário de pedido                                               */
 /* ================================================================== */
@@ -342,10 +444,14 @@ function buildInitialForm(initial) {
       obs: initial.observacoes || "",
       endereco: initial.endereco || "",
       referencia: initial.referencia || "",
+      pagamento: initial.pagamento || "",
+      valor: valorParaInput(initial.valor),
+      forma: initial.formaPagamento || "",
+      troco: valorParaInput(initial.trocoPara),
       selections: JSON.parse(JSON.stringify(initial.selections || {})),
     };
   }
-  return { nome: "", tipo: "local", horario: "", obs: "", endereco: "", referencia: "", selections: {} };
+  return { nome: "", tipo: "local", horario: "", obs: "", endereco: "", referencia: "", pagamento: "", valor: "", forma: "", troco: "", selections: {} };
 }
 
 function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
@@ -376,9 +482,27 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
 
   const precisaEndereco = f.tipo === "entrega";
   const enderecoOk = !precisaEndereco || f.endereco.trim().length > 0;
-  const canSubmit = f.nome.trim().length > 0 && enderecoOk;
+
+  /* Pagamento — obrigatório informar na entrega, para o entregador saber se cobra. */
+  const valorNum = parseValor(f.valor);
+  const trocoNum = parseValor(f.troco);
+  const ehDinheiro = f.forma === "dinheiro";
+  let pagamentoErro = "";
+  if (precisaEndereco) {
+    if (!f.pagamento) pagamentoErro = "Informe se já foi pago ou se o entregador vai receber";
+    else if (f.pagamento === "receber") {
+      if (!valorNum) pagamentoErro = "Informe o valor a receber";
+      else if (!f.forma) pagamentoErro = "Escolha a forma de pagamento";
+      else if (ehDinheiro && f.troco.trim() && (trocoNum == null || trocoNum < valorNum)) pagamentoErro = "O troco deve ser para um valor maior que o total";
+    }
+  }
+  const pagamentoOk = !pagamentoErro;
+  const trocoPrevisto = ehDinheiro && valorNum && trocoNum && trocoNum > valorNum ? trocoNum - valorNum : 0;
+
+  const canSubmit = f.nome.trim().length > 0 && enderecoOk && pagamentoOk;
   const submit = () => {
     if (!canSubmit) return;
+    const receber = f.tipo === "entrega" && f.pagamento === "receber";
     onSubmit({
       nome: f.nome.trim(),
       tipo: f.tipo,
@@ -386,6 +510,10 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
       observacoes: f.obs.trim(),
       endereco: f.tipo === "entrega" ? f.endereco.trim() : "",
       referencia: f.tipo === "entrega" ? f.referencia.trim() : "",
+      pagamento: f.tipo === "entrega" ? f.pagamento : "",
+      valor: receber ? valorNum : null,
+      formaPagamento: receber ? f.forma : "",
+      trocoPara: receber && ehDinheiro && trocoPrevisto ? trocoNum : null,
       selections: JSON.parse(JSON.stringify(f.selections)),
       itens: resolveItens(menu, f.selections),
     }, editId);
@@ -437,6 +565,58 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
             {!enderecoOk && (
               <p className="text-xs text-red-600 font-semibold flex items-center gap-1">
                 <AlertTriangle size={12} /> O endereço é obrigatório para entrega
+              </p>
+            )}
+          </div>
+        )}
+
+        {f.tipo === "entrega" && (
+          <div className="rounded-2xl border-2 border-amber-300 bg-amber-50 p-3 space-y-3">
+            <div className="flex items-center gap-2 text-amber-800 font-bold text-sm uppercase tracking-wide">
+              <Wallet size={16} /> Pagamento (para o entregador)
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <button onClick={() => setTop("pagamento", "pago")}
+                className={"rounded-xl font-bold flex items-center justify-center gap-2 border-2 " + (f.pagamento === "pago" ? "bg-green-600 border-green-600 text-white" : "bg-white border-slate-200 text-slate-600")} style={{ minHeight: "54px" }}>
+                <CheckCircle2 size={18} /> Já pago
+              </button>
+              <button onClick={() => setTop("pagamento", "receber")}
+                className={"rounded-xl font-bold flex items-center justify-center gap-2 border-2 " + (f.pagamento === "receber" ? "bg-amber-600 border-amber-600 text-white" : "bg-white border-slate-200 text-slate-600")} style={{ minHeight: "54px" }}>
+                <Banknote size={18} /> Receber na entrega
+              </button>
+            </div>
+
+            {f.pagamento === "receber" && (
+              <>
+                <div>
+                  <div className="text-xs font-semibold text-slate-600 mb-1">Valor a receber (R$)</div>
+                  <input value={f.valor} onChange={(e) => setTop("valor", e.target.value)} inputMode="decimal" placeholder="Ex: 35,00"
+                    className={inputCls + " bg-white text-xl font-extrabold"} />
+                </div>
+                <div>
+                  <div className="text-xs font-semibold text-slate-600 mb-1">Forma de pagamento</div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {FORMAS_PAGAMENTO.map((fp) => (
+                      <Chip key={fp.id} active={f.forma === fp.id} onClick={() => setTop("forma", fp.id)}>{fp.label}</Chip>
+                    ))}
+                  </div>
+                </div>
+                {ehDinheiro && (
+                  <div>
+                    <div className="text-xs font-semibold text-slate-600 mb-1">Troco para quanto? (opcional)</div>
+                    <input value={f.troco} onChange={(e) => setTop("troco", e.target.value)} inputMode="decimal" placeholder="Ex: 50,00 — deixe vazio se não precisa"
+                      className={inputCls + " bg-white"} />
+                    {trocoPrevisto > 0 && (
+                      <p className="text-xs text-amber-800 font-semibold mt-1">Entregador leva {fmtBRL(trocoPrevisto)} de troco</p>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+
+            {pagamentoErro && (
+              <p className="text-xs text-red-600 font-semibold flex items-center gap-1">
+                <AlertTriangle size={12} /> {pagamentoErro}
               </p>
             )}
           </div>
@@ -509,7 +689,7 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
         {editId && <p className="text-center text-xs font-bold text-amber-600 mb-1">✏️ Editando pedido enviado — as alterações vão para a cozinha</p>}
         {!canSubmit && (
           <p className="text-center text-xs text-slate-400 mb-1">
-            {f.nome.trim().length === 0 ? "Informe o nome para enviar" : "Informe o endereço da entrega"}
+            {f.nome.trim().length === 0 ? "Informe o nome para enviar" : !enderecoOk ? "Informe o endereço da entrega" : pagamentoErro}
           </p>
         )}
         <button onClick={submit} disabled={!canSubmit}
@@ -583,6 +763,10 @@ function AtendenteView({ orders, menu, prefill, formSeed, nowTs, headerH, onCrea
                     <p className="mt-2 text-xs text-slate-500 flex items-start gap-1">
                       <MapPin size={13} className="mt-0.5 shrink-0" /> {enderecoCompleto(o)}
                     </p>
+                  )}
+
+                  {o.tipo === "entrega" && o.status !== "cancelado" && (
+                    <div className="mt-2 flex"><PagamentoInfo order={o} /></div>
                   )}
 
                   {isEntregaAtiva(o) && (
@@ -795,6 +979,7 @@ function gerarRelatorioPDF(entregues) {
   const dataStr = now.toLocaleDateString("pt-BR", { weekday: "long", day: "2-digit", month: "long", year: "numeric" });
   const totalLocal = rows.filter((o) => o.tipo !== "entrega").length;
   const totalEntrega = rows.filter((o) => o.tipo === "entrega").length;
+  const totalRecebido = rows.filter((o) => aReceber(o) && o.recebidoAt).reduce((t, o) => t + o.valor, 0);
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
   const trs = rows.map((o, i) => `<tr>
       <td class="c">${i + 1}</td>
@@ -803,6 +988,7 @@ function gerarRelatorioPDF(entregues) {
       <td class="c">${o.horario ? esc(o.horario) : "—"}</td>
       <td>${esc(flatSummary(o))}</td>
       <td class="end">${o.tipo === "entrega" ? esc(enderecoCompleto(o)) : "—"}</td>
+      <td>${o.tipo === "entrega" ? esc(pagamentoResumo(o)) : "—"}</td>
       <td class="obs">${esc(o.observacoes || "")}</td>
       <td class="c">${fmtHM(o.completedAt)}</td>
     </tr>`).join("");
@@ -828,9 +1014,10 @@ function gerarRelatorioPDF(entregues) {
       <div class="kpi"><b>${rows.length}</b><span>Pratos entregues</span></div>
       <div class="kpi"><b>${totalLocal}</b><span>No local</span></div>
       <div class="kpi"><b>${totalEntrega}</b><span>Entregas</span></div>
+      <div class="kpi"><b>${esc(fmtBRL(totalRecebido))}</b><span>Recebido nas entregas</span></div>
     </div>
-    <table><thead><tr><th>#</th><th>Cliente</th><th>Tipo</th><th>Horário</th><th>Itens</th><th>Endereço</th><th>Observações</th><th>Concluído</th></tr></thead>
-    <tbody>${trs || '<tr><td colspan="8" class="c">Nenhum pedido.</td></tr>'}</tbody></table>
+    <table><thead><tr><th>#</th><th>Cliente</th><th>Tipo</th><th>Horário</th><th>Itens</th><th>Endereço</th><th>Pagamento</th><th>Observações</th><th>Concluído</th></tr></thead>
+    <tbody>${trs || '<tr><td colspan="9" class="c">Nenhum pedido.</td></tr>'}</tbody></table>
     <button class="print" onclick="window.print()">🖨️ Imprimir / Salvar como PDF</button>
     <script>window.onload=function(){setTimeout(function(){window.print();},400);};</script>
     </body></html>`;
@@ -1077,6 +1264,8 @@ function EntregaCard({ order, nowTs, variant, onStartRoute, onDelivered, onBackT
         </div>
       )}
 
+      <PagamentoInfo order={order} size="lg" />
+
       <div className="mt-3 space-y-3">
         {order.itens.length ? order.itens.map((g, i) => {
           const beb = isBebidaCat(g.categoria);
@@ -1112,7 +1301,7 @@ function EntregaCard({ order, nowTs, variant, onStartRoute, onDelivered, onBackT
             </button>
           ) : (
             <button onClick={() => onDelivered(order.id)} className="w-full rounded-xl font-extrabold text-lg bg-green-600 text-white flex items-center justify-center gap-2 active:bg-green-700" style={{ minHeight: "58px" }}>
-              <CheckCircle2 size={22} /> ENTREGUE AO CLIENTE
+              <CheckCircle2 size={22} /> {aReceber(order) ? "RECEBER E ENTREGAR" : "ENTREGUE AO CLIENTE"}
             </button>
           )}
           {confirmVolta ? (
@@ -1131,8 +1320,46 @@ function EntregaCard({ order, nowTs, variant, onStartRoute, onDelivered, onBackT
   );
 }
 
+/* Confirma que o entregador recebeu o valor antes de concluir a entrega. */
+function RecebimentoModal({ order, onConfirm, onCancel }) {
+  if (!order) return null;
+  const troco = trocoDe(order);
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: "rgba(0,0,0,0.55)" }}>
+      <div className="w-full rounded-2xl bg-white p-5 shadow-xl" style={{ maxWidth: "420px" }}>
+        <div className="flex items-center gap-2 text-amber-700 font-extrabold text-lg">
+          <Banknote size={24} /> Recebeu o pagamento?
+        </div>
+        <p className="text-sm text-slate-600 mt-1">Pedido de <b>{order.nome}</b>:</p>
+        <div className="mt-3 rounded-xl border-4 border-amber-500 bg-amber-50 p-3">
+          <div className="text-3xl font-extrabold text-slate-900">{fmtBRL(order.valor)}</div>
+          <div className="text-sm font-bold text-slate-700 mt-1">{formaLabel(order.formaPagamento)}</div>
+          {troco > 0 && <div className="text-sm font-semibold text-amber-900 mt-1">Troco: {fmtBRL(troco)} (para {fmtBRL(order.trocoPara)})</div>}
+        </div>
+        <div className="mt-4 grid grid-cols-2 gap-2">
+          <button onClick={onCancel} className="rounded-xl bg-slate-200 text-slate-700 font-bold" style={{ minHeight: "54px" }}>
+            Ainda não
+          </button>
+          <button onClick={onConfirm} className="rounded-xl bg-green-600 text-white font-extrabold flex items-center justify-center gap-2 active:bg-green-700" style={{ minHeight: "54px" }}>
+            <CheckCircle2 size={20} /> Recebi, entregue
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function EntregadorView({ orders, nowTs, headerH, onStartRoute, onDelivered, onBackToKitchen, onCopied }) {
   const [tab, setTab] = useState("aguardando");
+  const [cobrando, setCobrando] = useState(null);
+
+  /* Entrega com valor a receber passa pela confirmação do recebimento. */
+  const delivered = (id) => {
+    const o = orders.find((x) => x.id === id);
+    if (o && aReceber(o)) { setCobrando(o); return; }
+    onDelivered(id);
+  };
+  const confirmRecebimento = () => { const o = cobrando; setCobrando(null); if (o) onDelivered(o.id); };
 
   const aguardando = orders.filter((o) => o.status === "aguardando_entrega").sort((a, b) => targetTs(a, nowTs) - targetTs(b, nowTs));
   const emRota = orders.filter((o) => o.status === "em_rota").sort((a, b) => (a.outAt || 0) - (b.outAt || 0));
@@ -1141,6 +1368,13 @@ function EntregadorView({ orders, nowTs, headerH, onStartRoute, onDelivered, onB
   /* Ao sair para entregar, leva o entregador direto para a aba "Em rota",
      senão ele ficaria olhando uma lista vazia. */
   const startRoute = (id) => { onStartRoute(id); setTab("rota"); };
+
+  const somaReceber = (list) => list.filter(aReceber).reduce((t, o) => t + o.valor, 0);
+  const trocoTotal = (tab === "aguardando" ? aguardando : emRota).reduce((t, o) => t + trocoDe(o), 0);
+  const recebidos = entregues.filter((o) => aReceber(o) && o.recebidoAt);
+  const recebidoTotal = recebidos.reduce((t, o) => t + o.valor, 0);
+  const recebidoDinheiro = recebidos.filter((o) => o.formaPagamento === "dinheiro").reduce((t, o) => t + o.valor, 0);
+  const aCobrar = somaReceber(tab === "aguardando" ? aguardando : emRota);
 
   const lista = tab === "aguardando" ? aguardando : tab === "rota" ? emRota : entregues;
   const vazio = tab === "aguardando" ? "Nenhuma entrega pronta no momento."
@@ -1171,11 +1405,26 @@ function EntregadorView({ orders, nowTs, headerH, onStartRoute, onDelivered, onB
           </a>
         )}
 
+        {tab !== "entregues" && aCobrar > 0 && (
+          <div className="rounded-xl bg-amber-100 border-2 border-amber-300 px-3 py-2 text-sm font-bold text-amber-900 flex items-center gap-2">
+            <Banknote size={18} className="shrink-0" />
+            <span>A cobrar nesta aba: {fmtBRL(aCobrar)}{trocoTotal > 0 ? ` · leve ${fmtBRL(trocoTotal)} em troco` : ""}</span>
+          </div>
+        )}
+        {tab === "entregues" && recebidoTotal > 0 && (
+          <div className="rounded-xl bg-green-100 border-2 border-green-300 px-3 py-2 text-sm font-bold text-green-900 flex items-center gap-2">
+            <Wallet size={18} className="shrink-0" />
+            <span>Recebido nas entregas: {fmtBRL(recebidoTotal)}{recebidoDinheiro > 0 ? ` · em dinheiro: ${fmtBRL(recebidoDinheiro)}` : ""}</span>
+          </div>
+        )}
+
         {lista.length === 0 ? <Empty>{vazio}</Empty> : lista.map((o) => (
           <EntregaCard key={o.id} order={o} nowTs={nowTs} variant={tab === "entregues" ? "entregue" : "ativa"}
-            onStartRoute={startRoute} onDelivered={onDelivered} onBackToKitchen={onBackToKitchen} onCopied={onCopied} />
+            onStartRoute={startRoute} onDelivered={delivered} onBackToKitchen={onBackToKitchen} onCopied={onCopied} />
         ))}
       </div>
+
+      <RecebimentoModal order={cobrando} onConfirm={confirmRecebimento} onCancel={() => setCobrando(null)} />
     </div>
   );
 }
@@ -1527,6 +1776,8 @@ function ComandaApp() {
             const o = orderFromRow(p.new); upsertOrder(o);
             if (p.eventType === "INSERT" && roleRef.current === "cozinha") dingNewOrder();
             if (p.eventType === "UPDATE" && p.new.status === "concluido" && (!p.old || p.old.status !== "concluido") && roleRef.current === "atendente") chimeDone();
+            if (p.eventType === "UPDATE" && p.new.recebido_at && (!p.old || !p.old.recebido_at) && roleRef.current === "atendente")
+              pushToast({ type: "success", message: `Entregador recebeu ${fmtBRL(o.valor)} (${formaLabel(o.formaPagamento)}) de ${o.nome}`, duration: 4000 });
             if (p.eventType === "UPDATE" && p.new.status === "aguardando_entrega" && (!p.old || p.old.status !== "aguardando_entrega") && roleRef.current === "entregador") dingNewOrder();
           })
           .on("postgres_changes", { event: "*", schema: "public", table: "messages" }, (p) => {
@@ -1571,6 +1822,7 @@ function ComandaApp() {
       supabase.from("orders").update({
         nome: data.nome, tipo: data.tipo, horario: data.horario, observacoes: data.observacoes,
         endereco: data.endereco || "", referencia: data.referencia || "",
+        pagamento: data.pagamento || "", valor: data.valor, forma_pagamento: data.formaPagamento || "", troco_para: data.trocoPara,
         itens: data.itens, selections: data.selections, edited: true,
       }).eq("id", editId).then(({ error }) => dbFail(error));
       return;
@@ -1613,8 +1865,9 @@ function ComandaApp() {
   const undoComplete = (toast) => {
     const o = orders.find((x) => x.id === toast.orderId);
     const patch = { status: toast.prevStatus, completed_at: null };
-    if (toast.message) patch.ready_at = null; // desfazer envio ao entregador
-    if (o) upsertOrder({ ...o, status: toast.prevStatus, completedAt: null, readyAt: toast.message ? null : o.readyAt });
+    if (toast.paraEntregador) patch.ready_at = null; // desfazer envio ao entregador
+    if (toast.recebido) patch.recebido_at = null; // desfazer recebimento na entrega
+    if (o) upsertOrder({ ...o, status: toast.prevStatus, completedAt: null, readyAt: toast.paraEntregador ? null : o.readyAt, recebidoAt: toast.recebido ? null : o.recebidoAt });
     removeToast(toast.id);
     supabase.from("orders").update(patch).eq("id", toast.orderId).then(({ error }) => dbFail(error));
   };
@@ -1623,7 +1876,7 @@ function ComandaApp() {
     const o = orders.find((x) => x.id === id); if (!o || o.status === "aguardando_entrega") return;
     const prevStatus = o.status; const ts = Date.now();
     upsertOrder({ ...o, status: "aguardando_entrega", readyAt: ts, skippedAt: null });
-    pushToast({ type: "undo", nome: o.nome, orderId: id, prevStatus, message: "enviado ao entregador", duration: 5000 });
+    pushToast({ type: "undo", nome: o.nome, orderId: id, prevStatus, paraEntregador: true, message: "enviado ao entregador", duration: 5000 });
     supabase.from("orders").update({ status: "aguardando_entrega", ready_at: ts, skipped_at: null }).eq("id", id).then(({ error }) => dbFail(error));
   };
   const startRoute = (id) => {
@@ -1632,6 +1885,15 @@ function ComandaApp() {
     upsertOrder({ ...o, status: "em_rota", outAt: ts });
     pushToast({ type: "success", message: `Saindo para entregar: ${o.nome}`, duration: 2500 });
     supabase.from("orders").update({ status: "em_rota", out_at: ts }).eq("id", id).then(({ error }) => dbFail(error));
+  };
+  /* Entregador concluiu: se havia valor a receber, registra o recebimento. */
+  const deliverOrder = (id) => {
+    const o = orders.find((x) => x.id === id); if (!o || o.status === "concluido") return;
+    if (!aReceber(o)) { completeOrder(id); return; }
+    const prevStatus = o.status; const ts = Date.now();
+    upsertOrder({ ...o, status: "concluido", completedAt: ts, recebidoAt: ts, skippedAt: null });
+    pushToast({ type: "undo", nome: o.nome, orderId: id, prevStatus, recebido: true, message: `entregue · ${fmtBRL(o.valor)} recebido`, duration: 5000 });
+    supabase.from("orders").update({ status: "concluido", completed_at: ts, recebido_at: ts, skipped_at: null }).eq("id", id).then(({ error }) => dbFail(error));
   };
   const backToKitchen = (id) => {
     const o = orders.find((x) => x.id === id); if (!o) return;
@@ -1652,7 +1914,8 @@ function ComandaApp() {
     setView("atendente");
   };
   const editOrder = (order) => {
-    setPrefill({ mode: "edit", editId: order.id, nome: order.nome, tipo: order.tipo, horario: order.horario, observacoes: order.observacoes, endereco: order.endereco, referencia: order.referencia, selections: order.selections });
+    setPrefill({ mode: "edit", editId: order.id, nome: order.nome, tipo: order.tipo, horario: order.horario, observacoes: order.observacoes, endereco: order.endereco, referencia: order.referencia,
+      pagamento: order.pagamento, valor: order.valor, formaPagamento: order.formaPagamento, trocoPara: order.trocoPara, selections: order.selections });
     setFormSeed((n) => n + 1);
     setView("atendente");
   };
@@ -1736,7 +1999,7 @@ function ComandaApp() {
               <CozinhaView orders={orders} nowTs={nowTs} headerH={headerH} onPrepare={prepareToggle} onComplete={completeOrder} onSkip={skipOrder} onBackToQueue={backToQueue} onClearHistory={clearHistory} onSendToDelivery={sendToDelivery} />
             )}
             {view === "entregador" && (
-              <EntregadorView orders={orders} nowTs={nowTs} headerH={headerH} onStartRoute={startRoute} onDelivered={completeOrder} onBackToKitchen={backToKitchen}
+              <EntregadorView orders={orders} nowTs={nowTs} headerH={headerH} onStartRoute={startRoute} onDelivered={deliverOrder} onBackToKitchen={backToKitchen}
                 onCopied={() => pushToast({ type: "success", message: "Endereço copiado", duration: 1800 })} />
             )}
             {view === "admin" && (
