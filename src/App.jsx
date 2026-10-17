@@ -1433,7 +1433,54 @@ function EntregadorView({ orders, nowTs, headerH, onStartRoute, onDelivered, onB
 /*  Visão Administração (cardápios)                                    */
 /* ================================================================== */
 
-function AdminView({ menus, activeMenuId, onCreateMenu, onSaveMenu, onDeleteMenu, onSetActive }) {
+function NovoDiaCard({ orders, messagesCount, onClearAll }) {
+  const [confirmando, setConfirmando] = useState(false);
+  const concluidos = orders.filter((o) => o.status === "concluido");
+  const emAndamento = orders.filter((o) => !["concluido", "cancelado"].includes(o.status)).length;
+  const vazio = orders.length === 0 && messagesCount === 0;
+
+  return (
+    <div className="rounded-2xl border-2 border-red-200 bg-red-50 p-4">
+      <div className="flex items-center gap-2 font-bold text-red-800"><Trash2 size={18} /> Novo dia de vendas</div>
+      <p className="text-sm text-red-900/80 mt-1">
+        Apaga <b>todo o histórico</b> em todas as abas e em todos os aparelhos: pedidos (atendente, cozinha, entregador) e o chat.
+        Os cardápios <b>não</b> são apagados.
+      </p>
+      <button onClick={() => setConfirmando(true)} disabled={vazio}
+        className={"mt-3 w-full rounded-xl font-extrabold flex items-center justify-center gap-2 " + (vazio ? "bg-slate-200 text-slate-400" : "bg-red-600 text-white active:bg-red-700")} style={{ minHeight: "54px" }}>
+        <Trash2 size={20} /> {vazio ? "Nada para apagar" : `Apagar todo o histórico (${orders.length} pedido${orders.length === 1 ? "" : "s"})`}
+      </button>
+
+      {confirmando && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: "rgba(0,0,0,0.55)" }}>
+          <div className="w-full rounded-2xl bg-white p-5 shadow-xl" style={{ maxWidth: "420px" }}>
+            <div className="flex items-center gap-2 text-red-700 font-extrabold text-lg"><AlertTriangle size={24} /> Apagar tudo e começar um novo dia?</div>
+            <ul className="text-sm text-slate-700 mt-2 space-y-1">
+              <li>• {orders.length} pedido(s) serão apagados de todos os aparelhos</li>
+              {messagesCount > 0 && <li>• {messagesCount} mensagem(ns) do chat</li>}
+            </ul>
+            {emAndamento > 0 && (
+              <p className="mt-2 rounded-lg bg-amber-100 text-amber-900 text-sm font-bold p-2 flex items-start gap-2">
+                <AlertTriangle size={16} className="mt-0.5 shrink-0" /> Atenção: {emAndamento} pedido(s) ainda estão em andamento (fila, preparo ou entrega) e também serão apagados.
+              </p>
+            )}
+            <p className="text-xs text-slate-500 mt-2">Isso não pode ser desfeito. Se quiser guardar, gere o relatório antes.</p>
+            <button onClick={() => gerarRelatorioPDF(concluidos)} disabled={!concluidos.length}
+              className={"mt-3 w-full rounded-xl font-bold flex items-center justify-center gap-2 " + (concluidos.length ? "bg-slate-900 text-white" : "bg-slate-200 text-slate-400")} style={{ minHeight: "48px" }}>
+              <ClipboardList size={18} /> Gerar relatório (PDF) antes
+            </button>
+            <div className="mt-2 grid grid-cols-2 gap-2">
+              <button onClick={() => setConfirmando(false)} className="rounded-xl bg-slate-200 text-slate-700 font-bold" style={{ minHeight: "54px" }}>Cancelar</button>
+              <button onClick={() => { onClearAll(); setConfirmando(false); }} className="rounded-xl bg-red-600 text-white font-extrabold active:bg-red-700" style={{ minHeight: "54px" }}>Sim, apagar tudo</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AdminView({ menus, activeMenuId, onCreateMenu, onSaveMenu, onDeleteMenu, onSetActive, orders, messagesCount, onClearAll }) {
   const [selectedId, setSelectedId] = useState(activeMenuId || (menus[0] && menus[0].id));
   const [draft, setDraft] = useState(null);
   const [dirty, setDirty] = useState(false);
@@ -1474,6 +1521,8 @@ function AdminView({ menus, activeMenuId, onCreateMenu, onSaveMenu, onDeleteMenu
         <div className="flex items-center gap-2 font-bold"><Settings size={18} /> Administração de cardápios</div>
         <p className="text-sm text-slate-300 mt-1">Configure os itens que o atendente pode marcar. O cardápio marcado como “EM USO” é o que aparece no formulário — troque conforme o dia.</p>
       </div>
+
+      <NovoDiaCard orders={orders} messagesCount={messagesCount} onClearAll={onClearAll} />
 
       <div className="space-y-2">
         <div className="text-sm font-bold text-slate-500 uppercase tracking-wide">Cardápios</div>
@@ -1616,6 +1665,43 @@ function ChatDrawer({ open, onClose, messages, role, onSend }) {
   );
 }
 
+/* Aviso central de chegada: some sozinho em 3 s ou ao tocar em OK.
+   Vários avisos seguidos do mesmo tipo se juntam num só, com todos os nomes. */
+const ALERTA_MS = 3000;
+const ALERTA_ESTILO = {
+  pedido:    { titulo: "NOVO PEDIDO!",   plural: "NOVOS PEDIDOS!",   cor: "bg-emerald-600", barra: "bg-emerald-600", icon: <ChefHat size={30} /> },
+  entrega:   { titulo: "NOVA ENTREGA!",  plural: "NOVAS ENTREGAS!",  cor: "bg-purple-600",  barra: "bg-purple-600",  icon: <Bike size={30} /> },
+  devolvido: { titulo: "PEDIDO DEVOLVIDO", plural: "PEDIDOS DEVOLVIDOS", cor: "bg-amber-600", barra: "bg-amber-600", icon: <RotateCcw size={30} /> },
+};
+
+function AlertaPopup({ alerta, onClose }) {
+  if (!alerta) return null;
+  const st = ALERTA_ESTILO[alerta.tipo] || ALERTA_ESTILO.pedido;
+  const varios = alerta.nomes.length > 1;
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-6" style={{ backgroundColor: "rgba(0,0,0,0.35)" }} onClick={onClose}>
+      <div className="w-full rounded-2xl bg-white shadow-2xl overflow-hidden" style={{ maxWidth: "360px" }} onClick={(e) => e.stopPropagation()}>
+        <div className={"text-white px-5 py-4 flex items-center gap-3 " + st.cor}>
+          <Bell size={30} className="shrink-0 animate-pulse" />
+          <div className="text-2xl font-extrabold leading-tight">{varios ? `${alerta.nomes.length} ${st.plural}` : st.titulo}</div>
+        </div>
+        <div className="px-5 py-4">
+          <div className="flex items-center gap-2 text-slate-400 mb-1">{st.icon}</div>
+          {alerta.nomes.slice(-5).map((n, i) => (
+            <div key={i} className="text-xl font-extrabold text-slate-900 break-words">{n}</div>
+          ))}
+          {alerta.nomes.length > 5 && <div className="text-sm text-slate-500">+{alerta.nomes.length - 5} outro(s)</div>}
+          {alerta.detalhe && <div className="text-sm font-semibold text-slate-500 mt-1">{alerta.detalhe}</div>}
+          <button onClick={onClose} className={"mt-4 w-full rounded-xl text-white font-extrabold text-lg " + st.cor} style={{ minHeight: "54px" }}>OK</button>
+        </div>
+        <div className="h-1.5 w-full bg-slate-100">
+          <div key={alerta.seq} className={"h-full " + st.barra} style={{ animation: `undobar ${ALERTA_MS}ms linear forwards` }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Toasts({ toasts, onUndo }) {
   if (!toasts.length) return null;
   return (
@@ -1687,6 +1773,9 @@ function ComandaApp() {
   const [ready, setReady] = useState(false);
   const [connError, setConnError] = useState("");
 
+  const [alerta, setAlerta] = useState(null);
+  const alertaTimer = useRef(null);
+
   const audioRef = useRef(null);
   const timers = useRef({});
   const headerRef = useRef(null);
@@ -1729,6 +1818,21 @@ function ComandaApp() {
       });
     } catch (e) { /* ignore */ }
   };
+  /* Os navegadores (principalmente iPhone) só liberam o som depois de um toque
+     na tela. Criamos/retomamos o áudio a cada toque, para que os avisos que
+     chegam depois (sem toque) consigam tocar. */
+  useEffect(() => {
+    const unlock = () => {
+      try {
+        if (!audioRef.current) { const AC = window.AudioContext || window.webkitAudioContext; audioRef.current = new AC(); }
+        if (audioRef.current.state === "suspended") audioRef.current.resume();
+      } catch (e) { /* ignore */ }
+    };
+    const evs = ["pointerdown", "touchstart", "keydown"];
+    evs.forEach((ev) => window.addEventListener(ev, unlock, { passive: true }));
+    return () => evs.forEach((ev) => window.removeEventListener(ev, unlock));
+  }, []);
+
   const dingNewOrder = () => playTone([784, 1046, 1318], "triangle", 0.18);
   const chimeDone = () => playTone([880, 660], "sine", 0.16);
   const blipChat = () => playTone([1174], "sine", 0.12);
@@ -1736,6 +1840,19 @@ function ComandaApp() {
   /* Toasts */
   const removeToast = (id) => { setToasts((t) => t.filter((x) => x.id !== id)); const tm = timers.current[id]; if (tm) { clearTimeout(tm); delete timers.current[id]; } };
   const pushToast = (toast) => { const id = uid(); setToasts((t) => [...t, { ...toast, id }]); timers.current[id] = setTimeout(() => removeToast(id), toast.duration || 2500); };
+
+  /* Popup de chegada (cozinha / entregador) */
+  const fecharAlerta = () => { clearTimeout(alertaTimer.current); setAlerta(null); };
+  const mostrarAlerta = (tipo, nome, detalhe) => {
+    setAlerta((a) => (a && a.tipo === tipo
+      ? { ...a, nomes: [...a.nomes, nome], detalhe: "", seq: a.seq + 1 }
+      : { tipo, nomes: [nome], detalhe, seq: 0 }));
+    clearTimeout(alertaTimer.current);
+    alertaTimer.current = setTimeout(() => setAlerta(null), ALERTA_MS);
+  };
+  useEffect(() => () => clearTimeout(alertaTimer.current), []);
+  // O aviso é de quem está na aba: ao trocar de aba, ele some.
+  useEffect(() => { fecharAlerta(); }, [view]); // eslint-disable-line
 
   /* Atualizações idempotentes de estado */
   const upsertOrder = (o) => setOrders((prev) => { const i = prev.findIndex((x) => x.id === o.id); if (i === -1) return [...prev, o]; const cp = [...prev]; cp[i] = o; return cp; });
@@ -1774,13 +1891,25 @@ function ComandaApp() {
           .on("postgres_changes", { event: "*", schema: "public", table: "orders" }, (p) => {
             if (p.eventType === "DELETE") { removeOrder(p.old.id); return; }
             const o = orderFromRow(p.new); upsertOrder(o);
-            if (p.eventType === "INSERT" && roleRef.current === "cozinha") dingNewOrder();
+            const statusMudou = (st) => p.eventType === "UPDATE" && p.new.status === st && (!p.old || p.old.status !== st);
+            if (p.eventType === "INSERT" && roleRef.current === "cozinha") {
+              dingNewOrder();
+              mostrarAlerta("pedido", o.nome, o.tipo === "entrega" ? "🚲 Entrega" + (o.horario ? ` · ${o.horario}` : "") : o.horario ? `Servir ${o.horario}` : "");
+            }
+            if (statusMudou("na_fila") && p.old && ENTREGA_STATUS.includes(p.old.status) && roleRef.current === "cozinha") {
+              dingNewOrder();
+              mostrarAlerta("devolvido", o.nome, "O entregador devolveu para a cozinha");
+            }
             if (p.eventType === "UPDATE" && p.new.status === "concluido" && (!p.old || p.old.status !== "concluido") && roleRef.current === "atendente") chimeDone();
             if (p.eventType === "UPDATE" && p.new.recebido_at && (!p.old || !p.old.recebido_at) && roleRef.current === "atendente")
               pushToast({ type: "success", message: `Entregador recebeu ${fmtBRL(o.valor)} (${formaLabel(o.formaPagamento)}) de ${o.nome}`, duration: 4000 });
-            if (p.eventType === "UPDATE" && p.new.status === "aguardando_entrega" && (!p.old || p.old.status !== "aguardando_entrega") && roleRef.current === "entregador") dingNewOrder();
+            if (statusMudou("aguardando_entrega") && roleRef.current === "entregador") {
+              dingNewOrder();
+              mostrarAlerta("entrega", o.nome, (o.endereco || "").trim());
+            }
           })
           .on("postgres_changes", { event: "*", schema: "public", table: "messages" }, (p) => {
+            if (p.eventType === "DELETE") { setMessages((prev) => prev.filter((x) => x.id !== p.old.id)); return; }
             if (p.eventType !== "INSERT") return;
             const m = msgFromRow(p.new); upsertMessage(m);
             if (m.sender !== roleRef.current) blipChat();
@@ -1908,6 +2037,14 @@ function ComandaApp() {
     if (ids.length) supabase.from("orders").delete().in("id", ids).then(({ error }) => dbFail(error));
   };
 
+  /* Novo dia: apaga TODOS os pedidos (qualquer situação) e o chat, em todos os aparelhos. */
+  const clearAllDay = () => {
+    setOrders([]); setMessages([]); setPrefill(null);
+    supabase.from("orders").delete().neq("id", "").then(({ error }) => dbFail(error));
+    supabase.from("messages").delete().neq("id", "").then(({ error }) => dbFail(error));
+    pushToast({ type: "success", message: "Histórico apagado — pronto para um novo dia!", duration: 3000 });
+  };
+
   const repeatOrder = (order) => {
     setPrefill({ mode: "repeat", tipo: order.tipo, horario: order.horario, observacoes: order.observacoes, endereco: order.endereco, referencia: order.referencia, selections: order.selections });
     setFormSeed((n) => n + 1);
@@ -2003,7 +2140,8 @@ function ComandaApp() {
                 onCopied={() => pushToast({ type: "success", message: "Endereço copiado", duration: 1800 })} />
             )}
             {view === "admin" && (
-              <AdminView menus={menus} activeMenuId={activeMenuId} onCreateMenu={createMenu} onSaveMenu={saveMenu} onDeleteMenu={deleteMenu} onSetActive={setActive} />
+              <AdminView menus={menus} activeMenuId={activeMenuId} onCreateMenu={createMenu} onSaveMenu={saveMenu} onDeleteMenu={deleteMenu} onSetActive={setActive}
+                orders={orders} messagesCount={messages.length} onClearAll={clearAllDay} />
             )}
           </>
         )}
@@ -2011,6 +2149,7 @@ function ComandaApp() {
 
       <ChatDrawer open={chatOpen} onClose={() => setChatOpen(false)} messages={messages} role={role} onSend={sendMessage} />
       <Toasts toasts={toasts} onUndo={undoComplete} />
+      <AlertaPopup alerta={alerta} onClose={fecharAlerta} />
     </div>
   );
 }
