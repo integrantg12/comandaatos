@@ -4,7 +4,9 @@ import {
   SkipForward, RotateCcw, CheckCircle2, AlertTriangle, Clock, Timer, Trash2, Undo2,
   ClipboardList, Plus, Bell, Copy, Home, Bike, Star, Save, WifiOff,
   MapPin, Navigation, Coffee, Package, Wallet, Banknote,
+  ShoppingBag, Link2, QrCode, ClipboardPaste, LogOut, Phone, Share2, ExternalLink, Lock, Search, MessageCircle, Users,
 } from "lucide-react";
+import QRCode from "qrcode";
 import { supabase, isConfigured } from "./supabaseClient";
 
 /* ================================================================== */
@@ -17,6 +19,7 @@ const STATUS = {
   pulado:     { label: "Pulado",     classes: "bg-amber-100 text-amber-800" },
   aguardando_entrega: { label: "Com o entregador", classes: "bg-purple-100 text-purple-700" },
   em_rota:    { label: "Saiu p/ entrega", classes: "bg-purple-600 text-white" },
+  pronto_retirada: { label: "Pronto p/ retirada", classes: "bg-teal-600 text-white" },
   concluido:  { label: "Concluído",  classes: "bg-green-100 text-green-700" },
   cancelado:  { label: "Cancelado",  classes: "bg-red-100 text-red-600" },
 };
@@ -72,9 +75,44 @@ function bebidasDoPedido(order) {
 }
 const temBebida = (order) => bebidasDoPedido(order).length > 0;
 
+/* ---- Tipos de pedido -------------------------------------------------
+   local    = REFEIÇÃO NA IGREJA   (cozinha conclui → servido)
+   retirada = RETIRADA NA IGREJA   (cozinha → "pronto p/ retirada" → cliente retirou)
+   entrega  = ENTREGA EM DOMICÍLIO (cozinha → entregador → entregue)
+   Só "entrega" vai para o entregador.                                   */
+const TIPOS = {
+  local:    { label: "REFEIÇÃO NA IGREJA",   l1: "Refeição", l2: "na igreja",   curto: "Na igreja", emoji: "🍽️", verbo: "SERVIR",   cor: "bg-slate-800 border-slate-800 text-white",    badge: "bg-slate-200 text-slate-800" },
+  retirada: { label: "RETIRADA NA IGREJA",   l1: "Retirada", l2: "na igreja",   curto: "Retirada",  emoji: "🛍️", verbo: "RETIRAR",  cor: "bg-teal-600 border-teal-600 text-white",      badge: "bg-teal-600 text-white" },
+  entrega:  { label: "ENTREGA EM DOMICÍLIO", l1: "Entrega",  l2: "em domicílio", curto: "Entrega",   emoji: "🛵", verbo: "ENTREGAR", cor: "bg-indigo-600 border-indigo-600 text-white",  badge: "bg-indigo-600 text-white" },
+};
+const tipoInfo = (t) => TIPOS[t] || TIPOS.local;
+const TipoIcon = ({ tipo, size = 16 }) => (tipo === "entrega" ? <Bike size={size} /> : tipo === "retirada" ? <ShoppingBag size={size} /> : <Utensils size={size} />);
+
 /* ---- Entrega ------------------------------------------------------- */
 const ENTREGA_STATUS = ["aguardando_entrega", "em_rota"];
 const isEntregaAtiva = (o) => ENTREGA_STATUS.includes(o.status);
+const ATIVOS = ["na_fila", "preparando", "pulado", "aguardando_entrega", "em_rota", "pronto_retirada"];
+
+/* ---- Acompanhamento do cliente --------------------------------------
+   Cada pedido tem um "código". O cliente abre  site/?p=CÓDIGO  e vê só os
+   pedidos com aquele código. Pedidos da mesma pessoa compartilham o código. */
+const CODIGO_LETRAS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // sem 0/O, 1/I/L
+const novoCodigo = () => {
+  let s = "";
+  const arr = new Uint32Array(6);
+  try { crypto.getRandomValues(arr); } catch (e) { for (let i = 0; i < 6; i++) arr[i] = Math.floor(Math.random() * 1e9); }
+  for (let i = 0; i < 6; i++) s += CODIGO_LETRAS[arr[i] % CODIGO_LETRAS.length];
+  return s;
+};
+const limpaCodigo = (c) => String(c || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 12);
+const soDigitos = (t) => String(t || "").replace(/\D/g, "");
+const linkAcompanhamento = (codigo) => `${window.location.origin}/?p=${codigo}`;
+/* wa.me exige DDI. Número brasileiro com 10/11 dígitos ganha o 55. */
+const foneWhats = (tel) => { const d = soDigitos(tel); if (!d) return ""; return d.length <= 11 ? "55" + d : d; };
+const whatsUrl = (tel, texto) => `https://wa.me/${foneWhats(tel)}?text=${encodeURIComponent(texto)}`;
+const mensagemAcompanhamento = (o) =>
+  `Olá, ${(o.nome || "").trim().split(" ")[0]}! 😊\nRecebemos seu pedido do *Almoço Atos*.\n\n` +
+  `Acompanhe em tempo real (cozinha, entrega…) tocando no link:\n${linkAcompanhamento(o.codigo)}`;
 
 const enderecoCompleto = (o) => {
   const e = (o.endereco || "").trim();
@@ -110,19 +148,81 @@ function parseValor(txt) {
 const fmtBRL = (n) => Number(n || 0).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 const valorParaInput = (n) => (n == null ? "" : Number(n).toFixed(2).replace(".", ","));
 
-const aReceber = (o) => o.tipo === "entrega" && o.pagamento === "receber" && o.valor > 0;
+/* Entrega e retirada têm bloco de pagamento (quem entrega/entrega no balcão cobra). */
+const temPagamento = (o) => o.tipo === "entrega" || o.tipo === "retirada";
+const aReceber = (o) => temPagamento(o) && o.pagamento === "receber" && o.valor > 0;
 const trocoDe = (o) => (aReceber(o) && o.formaPagamento === "dinheiro" && o.trocoPara > o.valor ? o.trocoPara - o.valor : 0);
 
 /* Texto curto do pagamento (cards do atendente e relatório). */
 function pagamentoResumo(o) {
-  if (o.tipo !== "entrega") return "";
+  if (!temPagamento(o)) return "";
   if (o.pagamento === "pago") return "Já pago";
+  if (o.pagamento === "junto") return "Cobrado junto com outro pedido";
   if (aReceber(o)) {
     let t = `${o.recebidoAt ? "Recebido" : "Receber"} ${fmtBRL(o.valor)} · ${formaLabel(o.formaPagamento)}`;
     if (trocoDe(o)) t += ` (troco p/ ${fmtBRL(o.trocoPara)})`;
     return t;
   }
-  return "Pagamento não informado";
+  return o.tipo === "retirada" ? "" : "Pagamento não informado";
+}
+
+/* ---- Ler a mensagem do app ALMOÇO ATOS (colada do WhatsApp) ---------
+   Preenche nome, telefone, código, tipo, endereço, horário, pagamento e
+   marca os itens do cardápio cujo nome aparece no pedido.              */
+const semAcento = (s) => String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+const ITENS_GENERICOS = ["outro", "outra", "outros", "outras"];
+function lerPedidoWhats(texto, menu) {
+  const t = String(texto || "").replace(/\r/g, "").replace(/[\u00a0\u202f]/g, " ").replace(/\*/g, "").replace(/_/g, "");
+  const pega = (re) => { const m = t.match(re); return m ? m[1].trim() : ""; };
+
+  const nome = pega(/Cliente:[ \t]*(.+)/i);
+  const telefone = pega(/Tel(?:efone)?:[ \t]*(.+)/i);
+  const codigo = limpaCodigo(pega(/[?&]p=([A-Za-z0-9]{4,12})/) || pega(/C[óo]digo[^:\n]*:[ \t]*([A-Za-z0-9]{4,12})/i));
+
+  const modal = semAcento(pega(/Modalidade:[ \t]*(.+)/i));
+  let tipo = "";
+  if (modal) tipo = /domic|entrega/.test(modal) ? "entrega" : /retir/.test(modal) ? "retirada" : "local";
+  else if (/retirada no local/i.test(t)) tipo = "retirada";
+  else if (/Endere[çc]o:/i.test(t)) tipo = "entrega";
+
+  const endereco = pega(/Endere[çc]o:[ \t]*(.+)/i);
+  let horario = pega(/Agendad[ao][ \t]*[–—-][ \t]*(\d{1,2}[:h]\d{2})/i).replace("h", ":");
+  if (horario) { const [h, m] = horario.split(":"); horario = `${pad2(Number(h))}:${m}`; }
+
+  const pg = semAcento(pega(/Pgto:[ \t]*(.+)/i) || pega(/Pagamento:[ \t]*(.+)/i));
+  const forma = /pix/.test(pg) ? "pix" : /dinheiro/.test(pg) ? "dinheiro" : /credito/.test(pg) ? "cartao_credito" : /debito/.test(pg) ? "cartao_debito" : "";
+  const total = parseValor(pega(/\bTOTAL:[ \t]*R\$[ \t]*([\d.,]+)/)); // maiúsculo: não confunde com "Subtotal"
+  const troco = parseValor(pega(/Troco para:[ \t]*R\$[ \t]*([\d.,]+)/i));
+  const obs = pega(/📝[ \t]*Obs:[ \t]*([\s\S]*?)(?:\n[ \t]*\n|\n🔎|$)/);
+
+  const mi = t.match(/ITENS:[ \t]*\n([\s\S]*?)\n[ \t]*(?:💰|Subtotal)/i);
+  const itensTexto = mi ? mi[1].replace(/^[ \t]+/gm, "").trim() : "";
+  /* Quantos pratos (o app Almoço informa "Pratos: N"). */
+  const pratos = Number(pega(/Pratos:[ \t]*(\d+)/i)) || 1;
+
+  const alvo = semAcento(itensTexto);
+  const temPalavra = (p) => {
+    const w = semAcento(p).trim();
+    if (!w || ITENS_GENERICOS.includes(w)) return false;
+    const esc = w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    /* começo de palavra: "Refri" acha "Refrigerante" */
+    return new RegExp(`(^|[^a-z0-9])${esc}`).test(alvo);
+  };
+  const selections = {};
+  let achados = 0;
+  ((menu && menu.categorias) || []).forEach((cat) => {
+    cat.itens.forEach((item) => {
+      if (!temPalavra(item.label)) return;
+      const val = { on: true };
+      if (item.tipo === "variacoes" && item.variacoes && item.variacoes.length) val.variant = item.variacoes.find(temPalavra) || item.variacoes[0];
+      if (item.tipo === "texto") val.text = "";
+      selections[cat.id] = { ...(selections[cat.id] || {}), [item.id]: val };
+      achados++;
+    });
+  });
+
+  const reconheceu = !!(nome || codigo || itensTexto);
+  return { reconheceu, nome, telefone, codigo, tipo, endereco, horario, forma, total, troco, obs, itensTexto, pratos: Math.max(pratos, 1), selections, achados };
 }
 
 function copiarTexto(txt, onOk) {
@@ -242,6 +342,8 @@ const orderFromRow = (r) => ({
   pagamento: r.pagamento || "", valor: r.valor != null ? Number(r.valor) : null,
   formaPagamento: r.forma_pagamento || "", trocoPara: r.troco_para != null ? Number(r.troco_para) : null,
   recebidoAt: r.recebido_at != null ? Number(r.recebido_at) : null,
+  codigo: r.codigo || "", telefone: r.telefone || "",
+  preparoAt: r.preparo_at != null ? Number(r.preparo_at) : null,
 });
 const orderToRow = (o) => ({
   id: o.id, nome: o.nome, tipo: o.tipo, horario: o.horario || "", status: o.status,
@@ -254,6 +356,8 @@ const orderToRow = (o) => ({
   pagamento: o.pagamento || "", valor: o.valor != null ? o.valor : null,
   forma_pagamento: o.formaPagamento || "", troco_para: o.trocoPara != null ? o.trocoPara : null,
   recebido_at: o.recebidoAt != null ? o.recebidoAt : null,
+  codigo: o.codigo || "", telefone: o.telefone || "",
+  preparo_at: o.preparoAt != null ? o.preparoAt : null,
 });
 const msgFromRow = (r) => ({ id: r.id, sender: r.sender, text: r.content, ts: Number(r.ts) });
 const msgToRow = (m) => ({ id: m.id, sender: m.sender, content: m.text, ts: m.ts });
@@ -348,18 +452,18 @@ function Tab({ active, onClick, children, count, icon }) {
 }
 
 function TipoBadge({ tipo, size = "md" }) {
-  const entrega = tipo === "entrega";
+  const ti = tipoInfo(tipo);
   const sm = size === "sm";
   return (
-    <span className={"rounded-full font-bold flex items-center gap-1 " + (entrega ? "bg-indigo-600 text-white" : "bg-slate-200 text-slate-700") + (sm ? " text-xs px-2 py-0.5" : " text-sm px-3 py-1")}>
-      {entrega ? <Bike size={sm ? 12 : 16} /> : <Home size={sm ? 12 : 16} />} {entrega ? "ENTREGA" : "LOCAL"}
+    <span className={"rounded-full font-bold flex items-center gap-1 " + ti.badge + (sm ? " text-xs px-2 py-0.5" : " text-sm px-3 py-1")}>
+      <TipoIcon tipo={tipo} size={sm ? 12 : 16} /> {ti.label}
     </span>
   );
 }
 
 function HorarioBadge({ info, tipo }) {
   if (!info) return null;
-  const verbo = tipo === "entrega" ? "ENTREGAR" : "SERVIR";
+  const verbo = tipoInfo(tipo).verbo;
   const cls =
     info.level === "urgente" ? "bg-red-600 text-white animate-pulse"
     : info.level === "breve" ? "bg-amber-500 text-white"
@@ -375,20 +479,23 @@ function HorarioBadge({ info, tipo }) {
 /* Situação do pagamento da entrega.
    size "lg" = bloco grande do entregador; "sm" = linha do atendente. */
 function PagamentoInfo({ order, size = "sm" }) {
-  if (order.tipo !== "entrega") return null;
+  if (!temPagamento(order)) return null;
   const lg = size === "lg";
   const receber = aReceber(order);
   const troco = trocoDe(order);
+  const quem = order.tipo === "retirada" ? "Atendente recebeu" : "Entregador recebeu";
 
   if (!lg) {
+    if (!pagamentoResumo(order)) return null;
     const cls = order.pagamento === "pago" ? "bg-green-100 text-green-800"
+      : order.pagamento === "junto" ? "bg-slate-100 text-slate-700 border border-slate-300"
       : receber && order.recebidoAt ? "bg-green-600 text-white"
       : receber ? "bg-amber-100 text-amber-900 border border-amber-300"
       : "bg-slate-100 text-slate-500";
     return (
       <span className={"rounded-lg text-xs font-bold px-2 py-1 flex items-center gap-1 " + cls}>
         <Wallet size={13} className="shrink-0" />
-        {receber && order.recebidoAt ? `Entregador recebeu ${fmtBRL(order.valor)} · ${formaLabel(order.formaPagamento)}` : pagamentoResumo(order)}
+        {receber && order.recebidoAt ? `${quem} ${fmtBRL(order.valor)} · ${formaLabel(order.formaPagamento)}` : pagamentoResumo(order)}
       </span>
     );
   }
@@ -404,11 +511,22 @@ function PagamentoInfo({ order, size = "sm" }) {
       </div>
     );
   }
+  if (order.pagamento === "junto") {
+    return (
+      <div className="mt-3 rounded-xl border-4 border-slate-300 bg-slate-50 p-3 flex items-center gap-2">
+        <Users size={24} className="text-slate-600 shrink-0" />
+        <div>
+          <div className="text-lg font-extrabold text-slate-800 leading-tight">PAGAMENTO JUNTO</div>
+          <div className="text-sm font-semibold text-slate-600">Cobrado no outro pedido de {order.nome} — não cobrar este</div>
+        </div>
+      </div>
+    );
+  }
   if (receber) {
     return (
       <div className={"mt-3 rounded-xl border-4 p-3 " + (order.recebidoAt ? "border-green-500 bg-green-50" : "border-amber-500 bg-amber-50")}>
         <div className={"flex items-center gap-1 text-xs font-extrabold uppercase tracking-wide " + (order.recebidoAt ? "text-green-800" : "text-amber-800")}>
-          <Banknote size={15} /> {order.recebidoAt ? `Recebido ${fmtHM(order.recebidoAt)}` : "Cobrar na entrega"}
+          <Banknote size={15} /> {order.recebidoAt ? `Recebido ${fmtHM(order.recebidoAt)}` : order.tipo === "retirada" ? "Cobrar na retirada" : "Cobrar na entrega"}
         </div>
         <div className="flex items-end justify-between gap-2 flex-wrap mt-1">
           <div className="text-3xl font-extrabold text-slate-900 leading-none">{fmtBRL(order.valor)}</div>
@@ -436,27 +554,77 @@ function PagamentoInfo({ order, size = "sm" }) {
 /* ================================================================== */
 
 function buildInitialForm(initial) {
-  if (initial) {
-    return {
-      nome: initial.mode === "edit" ? (initial.nome || "") : "",
-      tipo: initial.tipo || "local",
-      horario: initial.horario || "",
-      obs: initial.observacoes || "",
-      endereco: initial.endereco || "",
-      referencia: initial.referencia || "",
-      pagamento: initial.pagamento || "",
-      valor: valorParaInput(initial.valor),
-      forma: initial.formaPagamento || "",
-      troco: valorParaInput(initial.trocoPara),
-      selections: JSON.parse(JSON.stringify(initial.selections || {})),
-    };
-  }
-  return { nome: "", tipo: "local", horario: "", obs: "", endereco: "", referencia: "", pagamento: "", valor: "", forma: "", troco: "", selections: {} };
+  const vazio = { nome: "", telefone: "", codigo: "", tipo: "local", horario: "", obs: "", endereco: "", referencia: "", pagamento: "", valor: "", forma: "", troco: "", selections: {} };
+  if (!initial) return vazio;
+  const mesmoCliente = initial.mode === "edit" || initial.mode === "mais";
+  return {
+    ...vazio,
+    nome: mesmoCliente ? (initial.nome || "") : "",
+    telefone: mesmoCliente ? (initial.telefone || "") : "",
+    codigo: mesmoCliente ? (initial.codigo || "") : "",
+    tipo: initial.tipo || "local",
+    horario: initial.horario || "",
+    obs: initial.mode === "mais" ? "" : (initial.observacoes || ""),
+    endereco: initial.endereco || "",
+    referencia: initial.referencia || "",
+    pagamento: initial.pagamento || "",
+    valor: valorParaInput(initial.valor),
+    forma: initial.formaPagamento || "",
+    troco: valorParaInput(initial.trocoPara),
+    selections: initial.mode === "mais" ? {} : JSON.parse(JSON.stringify(initial.selections || {})),
+  };
 }
 
-function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
+/* Janela para colar a mensagem que chegou pelo WhatsApp (app Almoço Atos). */
+function ColarPedidoModal({ open, onClose, onLer }) {
+  const [txt, setTxt] = useState("");
+  const [erro, setErro] = useState("");
+  if (!open) return null;
+  const colarDaMemoria = async () => {
+    try {
+      const t = await navigator.clipboard.readText();
+      if (t) { setTxt(t); setErro(""); }
+    } catch (e) { setErro("Não deu para colar automaticamente. Toque e segure na caixa e escolha “Colar”."); }
+  };
+  const ler = () => {
+    const ok = onLer(txt);
+    if (ok) { setTxt(""); setErro(""); onClose(); }
+    else setErro("Não reconheci um pedido nesse texto. Copie a mensagem inteira do pedido no WhatsApp.");
+  };
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: "rgba(0,0,0,0.55)" }}>
+      <div className="w-full rounded-2xl bg-white p-5 shadow-xl" style={{ maxWidth: "460px" }}>
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 text-slate-800 font-extrabold text-lg"><ClipboardPaste size={22} /> Colar pedido do WhatsApp</div>
+          <button onClick={onClose} className="rounded-lg p-2 text-slate-500 active:bg-slate-100" aria-label="Fechar"><X size={20} /></button>
+        </div>
+        <ol className="text-sm text-slate-600 mt-2 space-y-0.5 list-decimal pl-5">
+          <li>No WhatsApp, toque e segure a mensagem do pedido → <b>Copiar</b>.</li>
+          <li>Volte aqui e toque em <b>Colar</b>.</li>
+          <li>Toque em <b>Preencher pedido</b> e confira.</li>
+        </ol>
+        <button onClick={colarDaMemoria} className="mt-3 w-full rounded-xl border-2 border-slate-300 text-slate-700 font-bold flex items-center justify-center gap-2" style={{ minHeight: "48px" }}>
+          <ClipboardPaste size={18} /> Colar
+        </button>
+        <textarea value={txt} onChange={(e) => { setTxt(e.target.value); setErro(""); }} rows={7}
+          placeholder="…ou toque aqui, segure e escolha “Colar”"
+          className="mt-2 w-full rounded-xl border-2 border-slate-200 px-3 py-2 text-sm text-slate-900 outline-none focus:border-emerald-500 resize-none" />
+        {erro && <p className="text-xs text-red-600 font-semibold mt-1 flex items-start gap-1"><AlertTriangle size={12} className="mt-0.5 shrink-0" /> {erro}</p>}
+        <button onClick={ler} disabled={!txt.trim()}
+          className={"mt-3 w-full rounded-xl font-extrabold text-lg flex items-center justify-center gap-2 " + (txt.trim() ? "bg-emerald-600 text-white active:bg-emerald-700" : "bg-slate-200 text-slate-400")} style={{ minHeight: "56px" }}>
+          <Check size={20} /> Preencher pedido
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function OrderForm({ menu, orders, initial, onSubmit, onConsumedPrefill }) {
   const [f, setF] = useState(() => buildInitialForm(initial));
   const [editId, setEditId] = useState(initial && initial.mode === "edit" ? initial.editId : null);
+  const [colarAberto, setColarAberto] = useState(false);
+  /* Referência do pedido colado (fica visível enquanto o atendente monta as comandas). */
+  const [ref, setRef] = useState(null);
 
   useEffect(() => { if (initial && onConsumedPrefill) onConsumedPrefill(); }, []); // eslint-disable-line
 
@@ -480,16 +648,43 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
   const setText = (cat, item, text) => setSel(cat.id, item.id, { on: true, text });
   const setTop = (k, v) => setF((p) => ({ ...p, [k]: v }));
 
+  const lerColado = (texto) => {
+    const r = lerPedidoWhats(texto, menu);
+    if (!r.reconheceu) return false;
+    const comPagamento = r.tipo === "entrega" || r.tipo === "retirada";
+    setEditId(null);
+    setF((p) => ({
+      ...buildInitialForm(null),
+      nome: r.nome || p.nome,
+      telefone: r.telefone,
+      codigo: r.codigo,
+      tipo: r.tipo || p.tipo,
+      endereco: r.tipo === "entrega" ? r.endereco : "",
+      horario: r.horario,
+      obs: r.obs,
+      pagamento: comPagamento && r.total ? "receber" : "",
+      valor: comPagamento && r.total ? valorParaInput(r.total) : "",
+      forma: comPagamento ? r.forma : "",
+      troco: comPagamento && r.forma === "dinheiro" && r.troco ? valorParaInput(r.troco) : "",
+      selections: r.selections,
+    }));
+    setRef({ itens: r.itensTexto, total: r.total, pratos: r.pratos, feito: 0, achados: r.achados });
+    return true;
+  };
+
+  const ti = tipoInfo(f.tipo);
   const precisaEndereco = f.tipo === "entrega";
+  const comPagamento = f.tipo === "entrega" || f.tipo === "retirada";
   const enderecoOk = !precisaEndereco || f.endereco.trim().length > 0;
 
-  /* Pagamento — obrigatório informar na entrega, para o entregador saber se cobra. */
+  /* Pagamento — obrigatório na entrega (o entregador precisa saber se cobra);
+     opcional na retirada. */
   const valorNum = parseValor(f.valor);
   const trocoNum = parseValor(f.troco);
   const ehDinheiro = f.forma === "dinheiro";
   let pagamentoErro = "";
-  if (precisaEndereco) {
-    if (!f.pagamento) pagamentoErro = "Informe se já foi pago ou se o entregador vai receber";
+  if (comPagamento) {
+    if (!f.pagamento && precisaEndereco) pagamentoErro = "Informe se já foi pago ou se o entregador vai receber";
     else if (f.pagamento === "receber") {
       if (!valorNum) pagamentoErro = "Informe o valor a receber";
       else if (!f.forma) pagamentoErro = "Escolha a forma de pagamento";
@@ -499,18 +694,26 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
   const pagamentoOk = !pagamentoErro;
   const trocoPrevisto = ehDinheiro && valorNum && trocoNum && trocoNum > valorNum ? trocoNum - valorNum : 0;
 
+  /* Com quem este pedido vai ficar no mesmo link de acompanhamento */
+  const telDig = soDigitos(f.telefone);
+  const vinculados = f.codigo
+    ? orders.filter((o) => o.codigo === f.codigo && o.id !== editId)
+    : telDig.length >= 8 ? orders.filter((o) => o.codigo && soDigitos(o.telefone) === telDig && o.id !== editId) : [];
+
   const canSubmit = f.nome.trim().length > 0 && enderecoOk && pagamentoOk;
   const submit = () => {
     if (!canSubmit) return;
-    const receber = f.tipo === "entrega" && f.pagamento === "receber";
+    const receber = comPagamento && f.pagamento === "receber";
     onSubmit({
       nome: f.nome.trim(),
+      telefone: f.telefone.trim(),
+      codigo: limpaCodigo(f.codigo),
       tipo: f.tipo,
       horario: f.horario,
       observacoes: f.obs.trim(),
       endereco: f.tipo === "entrega" ? f.endereco.trim() : "",
       referencia: f.tipo === "entrega" ? f.referencia.trim() : "",
-      pagamento: f.tipo === "entrega" ? f.pagamento : "",
+      pagamento: comPagamento ? f.pagamento : "",
       valor: receber ? valorNum : null,
       formaPagamento: receber ? f.forma : "",
       trocoPara: receber && ehDinheiro && trocoPrevisto ? trocoNum : null,
@@ -518,6 +721,15 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
       itens: resolveItens(menu, f.selections),
     }, editId);
     setEditId(null);
+    /* Pedido colado com vários pratos: já prepara a próxima comanda do mesmo cliente
+       (mesmo link de acompanhamento; pagamento "junto" para não cobrar duas vezes). */
+    if (!editId && ref && ref.feito + 1 < ref.pratos) {
+      setF((p) => ({ ...p, obs: "", selections: {}, pagamento: comPagamento ? "junto" : "", valor: "", forma: "", troco: "" }));
+      setRef((r) => ({ ...r, feito: r.feito + 1 }));
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      return;
+    }
+    setRef(null);
     setF(buildInitialForm(null));
   };
 
@@ -526,23 +738,80 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
   return (
     <div>
       <div className="p-4 space-y-5">
+        {!editId && (
+          <button onClick={() => setColarAberto(true)}
+            className="w-full rounded-xl border-2 border-dashed border-emerald-400 bg-emerald-50 text-emerald-800 font-bold flex items-center justify-center gap-2" style={{ minHeight: "52px" }}>
+            <ClipboardPaste size={20} /> Colar pedido do WhatsApp (app Almoço)
+          </button>
+        )}
+
+        {ref && (
+          <div className="rounded-2xl border-2 border-emerald-400 bg-white p-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-xs font-extrabold uppercase tracking-wide text-emerald-700 flex items-center gap-1"><ClipboardList size={14} /> Pedido colado (referência)</div>
+              <button onClick={() => setRef(null)} className="rounded-lg p-1 text-slate-400" aria-label="Fechar referência"><X size={16} /></button>
+            </div>
+            {ref.itens && <pre className="mt-1 whitespace-pre-wrap text-sm text-slate-800 font-sans leading-snug">{ref.itens}</pre>}
+            {ref.total != null && <div className="mt-1 text-sm font-bold text-slate-700">Total no app: {fmtBRL(ref.total)}</div>}
+            <p className="mt-2 text-xs font-semibold text-emerald-800">
+              {ref.achados > 0 ? `✓ ${ref.achados} item(ns) já marcado(s) abaixo. ` : ""}Confira os itens e marque o que faltar.
+            </p>
+            {ref.pratos > 1 && (
+              <p className="mt-1 rounded-lg bg-amber-100 text-amber-900 text-xs font-bold p-2">
+                Este pedido tem {ref.pratos} pratos — faça 1 comanda por prato. Agora: <b>prato {ref.feito + 1} de {ref.pratos}</b>.
+                {ref.feito === 0 ? " Ao enviar, o próximo já vem com os dados do cliente." : " O pagamento já foi lançado no 1º prato (aqui fica “junto”)."}
+              </p>
+            )}
+          </div>
+        )}
+
         <div>
           <div className="text-sm font-bold text-slate-500 uppercase tracking-wide mb-2">Nome do cliente</div>
           <input autoFocus value={f.nome} onChange={(e) => setTop("nome", e.target.value)} placeholder="Ex: Dona Maria"
             className="w-full rounded-xl border-2 border-slate-200 px-4 text-2xl font-extrabold text-slate-900 outline-none focus:border-emerald-500" style={{ minHeight: "58px" }} />
         </div>
 
+        <div>
+          <div className="text-sm font-bold text-slate-500 uppercase tracking-wide mb-2 flex items-center gap-1"><Phone size={14} /> WhatsApp do cliente <span className="normal-case font-semibold text-slate-400">(opcional)</span></div>
+          <input value={f.telefone} onChange={(e) => setTop("telefone", e.target.value)} inputMode="tel" placeholder="Ex: (21) 99999-8888"
+            className={inputCls} />
+          <p className="text-xs text-slate-500 mt-1">Serve para mandar o link de acompanhamento. Pedidos com o mesmo número ficam no mesmo link.</p>
+          {(f.codigo || vinculados.length > 0) && (
+            <div className="mt-2 rounded-xl bg-sky-50 border-2 border-sky-200 px-3 py-2 text-xs font-semibold text-sky-900 flex items-start gap-2">
+              <Link2 size={14} className="mt-0.5 shrink-0" />
+              <span className="flex-1">
+                {f.codigo ? <>Acompanhamento: código <b>{f.codigo}</b>. </> : null}
+                {vinculados.length > 0
+                  ? <>Vai aparecer no mesmo link {vinculados.length === 1 ? "do outro pedido" : `dos outros ${vinculados.length} pedidos`} de <b>{vinculados[0].nome}</b>.</>
+                  : f.codigo ? "O cliente já tem este link (veio do app)." : null}
+              </span>
+              {f.codigo && !editId && (
+                <button onClick={() => setTop("codigo", "")} className="shrink-0 text-sky-700 underline">desvincular</button>
+              )}
+            </div>
+          )}
+        </div>
+
         <Section title="Tipo de pedido">
-          <div className="grid grid-cols-2 gap-2">
-            <button onClick={() => setTop("tipo", "local")}
-              className={"rounded-xl font-bold flex items-center justify-center gap-2 border-2 " + (f.tipo === "local" ? "bg-slate-800 border-slate-800 text-white" : "bg-white border-slate-200 text-slate-600")} style={{ minHeight: "56px" }}>
-              <Home size={20} /> No local
-            </button>
-            <button onClick={() => setTop("tipo", "entrega")}
-              className={"rounded-xl font-bold flex items-center justify-center gap-2 border-2 " + (f.tipo === "entrega" ? "bg-indigo-600 border-indigo-600 text-white" : "bg-white border-slate-200 text-slate-600")} style={{ minHeight: "56px" }}>
-              <Bike size={20} /> Entrega
-            </button>
+          <div className="grid grid-cols-3 gap-2">
+            {Object.keys(TIPOS).map((k) => {
+              const t = TIPOS[k];
+              const on = f.tipo === k;
+              return (
+                <button key={k} onClick={() => setTop("tipo", k)}
+                  className={"rounded-xl font-bold flex flex-col items-center justify-center gap-1 border-2 px-1 py-2 leading-tight text-center " + (on ? t.cor : "bg-white border-slate-200 text-slate-600")} style={{ minHeight: "76px" }}>
+                  <TipoIcon tipo={k} size={22} />
+                  <span className="text-sm">{t.l1}</span>
+                  <span className="text-xs font-semibold opacity-80">{t.l2}</span>
+                </button>
+              );
+            })}
           </div>
+          <p className="text-xs text-slate-500 mt-1">
+            {f.tipo === "entrega" ? "🛵 Vai para o entregador quando a cozinha terminar."
+              : f.tipo === "retirada" ? "🛍️ A cozinha avisa quando estiver pronto; o cliente busca na igreja."
+              : "🍽️ O cliente come na igreja. Não vai para o entregador."}
+          </p>
         </Section>
 
         {f.tipo === "entrega" && (
@@ -570,21 +839,28 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
           </div>
         )}
 
-        {f.tipo === "entrega" && (
+        {comPagamento && (
           <div className="rounded-2xl border-2 border-amber-300 bg-amber-50 p-3 space-y-3">
             <div className="flex items-center gap-2 text-amber-800 font-bold text-sm uppercase tracking-wide">
-              <Wallet size={16} /> Pagamento (para o entregador)
+              <Wallet size={16} /> {f.tipo === "entrega" ? "Pagamento (para o entregador)" : "Pagamento na retirada (opcional)"}
             </div>
-            <div className="grid grid-cols-2 gap-2">
-              <button onClick={() => setTop("pagamento", "pago")}
-                className={"rounded-xl font-bold flex items-center justify-center gap-2 border-2 " + (f.pagamento === "pago" ? "bg-green-600 border-green-600 text-white" : "bg-white border-slate-200 text-slate-600")} style={{ minHeight: "54px" }}>
+            <div className="grid grid-cols-3 gap-2">
+              <button onClick={() => setTop("pagamento", f.pagamento === "pago" && !precisaEndereco ? "" : "pago")}
+                className={"rounded-xl font-bold flex flex-col items-center justify-center gap-0.5 border-2 text-sm leading-tight " + (f.pagamento === "pago" ? "bg-green-600 border-green-600 text-white" : "bg-white border-slate-200 text-slate-600")} style={{ minHeight: "58px" }}>
                 <CheckCircle2 size={18} /> Já pago
               </button>
-              <button onClick={() => setTop("pagamento", "receber")}
-                className={"rounded-xl font-bold flex items-center justify-center gap-2 border-2 " + (f.pagamento === "receber" ? "bg-amber-600 border-amber-600 text-white" : "bg-white border-slate-200 text-slate-600")} style={{ minHeight: "54px" }}>
-                <Banknote size={18} /> Receber na entrega
+              <button onClick={() => setTop("pagamento", f.pagamento === "receber" && !precisaEndereco ? "" : "receber")}
+                className={"rounded-xl font-bold flex flex-col items-center justify-center gap-0.5 border-2 text-sm leading-tight " + (f.pagamento === "receber" ? "bg-amber-600 border-amber-600 text-white" : "bg-white border-slate-200 text-slate-600")} style={{ minHeight: "58px" }}>
+                <Banknote size={18} /> {f.tipo === "entrega" ? "Receber na entrega" : "Receber na retirada"}
+              </button>
+              <button onClick={() => setTop("pagamento", f.pagamento === "junto" && !precisaEndereco ? "" : "junto")}
+                className={"rounded-xl font-bold flex flex-col items-center justify-center gap-0.5 border-2 text-sm leading-tight " + (f.pagamento === "junto" ? "bg-slate-700 border-slate-700 text-white" : "bg-white border-slate-200 text-slate-600")} style={{ minHeight: "58px" }}>
+                <Users size={18} /> Junto c/ outro pedido
               </button>
             </div>
+            {f.pagamento === "junto" && (
+              <p className="text-xs text-slate-600 font-semibold">O valor é cobrado em outro pedido deste cliente — aqui não se cobra nada.</p>
+            )}
 
             {f.pagamento === "receber" && (
               <>
@@ -607,7 +883,7 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
                     <input value={f.troco} onChange={(e) => setTop("troco", e.target.value)} inputMode="decimal" placeholder="Ex: 50,00 — deixe vazio se não precisa"
                       className={inputCls + " bg-white"} />
                     {trocoPrevisto > 0 && (
-                      <p className="text-xs text-amber-800 font-semibold mt-1">Entregador leva {fmtBRL(trocoPrevisto)} de troco</p>
+                      <p className="text-xs text-amber-800 font-semibold mt-1">{f.tipo === "entrega" ? "Entregador leva" : "Separar"} {fmtBRL(trocoPrevisto)} de troco</p>
                     )}
                   </div>
                 )}
@@ -622,7 +898,7 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
           </div>
         )}
 
-        <Section title={f.tipo === "entrega" ? "Horário de entrega" : "Horário para servir"}>
+        <Section title={f.tipo === "entrega" ? "Horário de entrega" : f.tipo === "retirada" ? "Horário da retirada" : "Horário para servir"}>
           <div className="flex flex-wrap gap-2 mb-2">
             {[{ l: "Agora", v: "" }, { l: "+30 min", v: nowHHMM(30) }, { l: "+1 h", v: nowHHMM(60) }].map((p, i) => {
               const active = i === 0 ? f.horario === "" : false;
@@ -694,9 +970,11 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
         )}
         <button onClick={submit} disabled={!canSubmit}
           className={"w-full rounded-2xl font-extrabold text-lg flex items-center justify-center gap-2 " + (canSubmit ? (editId ? "bg-amber-600 text-white active:bg-amber-700" : "bg-green-600 text-white active:bg-green-700") : "bg-slate-300 text-slate-500")} style={{ minHeight: "60px" }}>
-          {editId ? <><Check size={22} /> Salvar alterações</> : <><Send size={22} /> Enviar para Cozinha</>}
+          {editId ? <><Check size={22} /> Salvar alterações</> : <><Send size={22} /> Enviar para Cozinha · {ti.curto}</>}
         </button>
       </div>
+
+      <ColarPedidoModal open={colarAberto} onClose={() => setColarAberto(false)} onLer={lerColado} />
     </div>
   );
 }
@@ -705,17 +983,177 @@ function OrderForm({ menu, initial, onSubmit, onConsumedPrefill }) {
 /*  Visão Atendente                                                    */
 /* ================================================================== */
 
-function AtendenteView({ orders, menu, prefill, formSeed, nowTs, headerH, onCreate, onEdit, onCancel, onRepeat, onConsumedPrefill }) {
+/* Link de acompanhamento do cliente: QR code, WhatsApp, copiar. */
+function LinkModal({ order, orders, onClose, onCopied }) {
+  const [qr, setQr] = useState("");
+  const link = order && order.codigo ? linkAcompanhamento(order.codigo) : "";
+  useEffect(() => {
+    if (!link) return;
+    QRCode.toDataURL(link, { width: 520, margin: 1, errorCorrectionLevel: "M" }).then(setQr).catch(() => setQr(""));
+  }, [link]);
+  if (!order) return null;
+  if (!order.codigo) {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: "rgba(0,0,0,0.55)" }}>
+        <div className="w-full rounded-2xl bg-white p-5 shadow-xl text-center" style={{ maxWidth: "420px" }}>
+          <p className="font-semibold text-slate-600">Gerando o link…</p>
+        </div>
+      </div>
+    );
+  }
+  const doMesmo = orders.filter((o) => o.codigo === order.codigo && o.status !== "cancelado");
+  const texto = mensagemAcompanhamento(order);
+  const tel = foneWhats(order.telefone);
+  const compartilhar = () => {
+    if (navigator.share) navigator.share({ title: "Acompanhe seu pedido", text: texto }).catch(() => {});
+    else copiarTexto(texto, onCopied);
+  };
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: "rgba(0,0,0,0.55)" }} onClick={onClose}>
+      <div className="w-full rounded-2xl bg-white p-5 shadow-xl overflow-y-auto" style={{ maxWidth: "420px", maxHeight: "94vh" }} onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 text-slate-800 font-extrabold text-lg"><Link2 size={22} /> Acompanhamento</div>
+          <button onClick={onClose} className="rounded-lg p-2 text-slate-500 active:bg-slate-100" aria-label="Fechar"><X size={20} /></button>
+        </div>
+        <p className="text-sm text-slate-600 mt-1">
+          <b>{order.nome}</b> acompanha {doMesmo.length > 1 ? `os ${doMesmo.length} pedidos` : "o pedido"} por este link, em tempo real.
+        </p>
+
+        <div className="mt-3 rounded-2xl border-2 border-slate-200 p-3 flex flex-col items-center">
+          {qr ? <img src={qr} alt="QR code do acompanhamento" className="w-full" style={{ maxWidth: "240px", imageRendering: "pixelated" }} /> : <div style={{ height: "240px" }} />}
+          <div className="text-xs font-bold text-slate-500 mt-1 flex items-center gap-1"><QrCode size={14} /> Peça para o cliente apontar a câmera do celular</div>
+          <div className="mt-2 rounded-lg bg-slate-900 text-white font-mono font-extrabold tracking-widest text-2xl px-4 py-1">{order.codigo}</div>
+        </div>
+
+        <div className="mt-3 space-y-2">
+          <a href={whatsUrl(tel, texto)} target="_blank" rel="noopener noreferrer"
+            className="w-full rounded-xl bg-green-600 text-white font-extrabold flex items-center justify-center gap-2 active:bg-green-700" style={{ minHeight: "54px" }}>
+            <MessageCircle size={20} /> {tel ? "Enviar no WhatsApp do cliente" : "Enviar por WhatsApp (escolher contato)"}
+          </a>
+          <div className="grid grid-cols-2 gap-2">
+            <button onClick={() => copiarTexto(link, onCopied)} className="rounded-xl border-2 border-slate-300 text-slate-700 font-bold flex items-center justify-center gap-1" style={{ minHeight: "48px" }}>
+              <Copy size={16} /> Copiar link
+            </button>
+            <button onClick={compartilhar} className="rounded-xl border-2 border-slate-300 text-slate-700 font-bold flex items-center justify-center gap-1" style={{ minHeight: "48px" }}>
+              <Share2 size={16} /> Compartilhar
+            </button>
+          </div>
+          <a href={link} target="_blank" rel="noopener noreferrer" className="w-full rounded-xl text-sky-700 font-semibold text-sm flex items-center justify-center gap-1" style={{ minHeight: "40px" }}>
+            <ExternalLink size={14} /> Ver como o cliente vê
+          </a>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AtendenteView({ orders, menu, prefill, formSeed, nowTs, headerH, onCreate, onEdit, onCancel, onRepeat, onMore, onConsumedPrefill, onPickup, onShowLink }) {
   const [sub, setSub] = useState("novo");
   const [confirmingId, setConfirmingId] = useState(null);
 
   useEffect(() => { if (prefill) setSub("novo"); }, [formSeed]); // eslint-disable-line
 
-  const activeCount = orders.filter((o) => ["na_fila", "preparando", "pulado", "aguardando_entrega", "em_rota"].includes(o.status)).length;
+  const activeCount = orders.filter((o) => ATIVOS.includes(o.status)).length;
   const recent = [...orders].sort((a, b) => b.createdAt - a.createdAt);
-  const groups = groupByClient(recent);
+  /* Prontos para retirada sobem para o topo: é o que o atendente precisa ver. */
+  const prontos = recent.filter((o) => o.status === "pronto_retirada");
+  const groups = groupByClient(recent.filter((o) => o.status !== "pronto_retirada"));
 
   const cancelavel = (o) => o.status !== "concluido" && o.status !== "cancelado";
+
+  const card = (o) => (
+    <div key={o.id} className={"rounded-2xl border-2 bg-white p-4 " + (o.status === "pronto_retirada" ? "border-teal-500 ring-2 ring-teal-200" : "border-slate-200")}>
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 min-w-0 flex-wrap">
+          <div className="rounded-lg bg-slate-900 text-white px-3 py-1 font-extrabold text-lg truncate" style={{ maxWidth: "170px" }}>{o.nome}</div>
+          <StatusBadge status={o.status} />
+          {o.edited && <span className="rounded-full bg-amber-100 text-amber-800 text-xs font-bold px-2 py-0.5">EDITADO</span>}
+        </div>
+        <div className="text-xs text-slate-400 shrink-0">{relTime(o.createdAt, nowTs)}</div>
+      </div>
+
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <TipoBadge tipo={o.tipo} size="sm" />
+        {o.horario && (
+          <span className="text-xs font-semibold text-indigo-700 flex items-center gap-1">
+            <Timer size={12} /> {o.tipo === "entrega" ? "Entregar" : o.tipo === "retirada" ? "Retirar" : "Servir"} {o.horario}
+          </span>
+        )}
+        {o.codigo && (
+          <button onClick={() => onShowLink(o)} className="rounded-full bg-sky-100 text-sky-800 text-xs font-bold px-2 py-0.5 flex items-center gap-1">
+            <Link2 size={12} /> {o.codigo}
+          </button>
+        )}
+      </div>
+
+      {o.tipo === "entrega" && enderecoCompleto(o) && (
+        <p className="mt-2 text-xs text-slate-500 flex items-start gap-1">
+          <MapPin size={13} className="mt-0.5 shrink-0" /> {enderecoCompleto(o)}
+        </p>
+      )}
+
+      {temPagamento(o) && o.status !== "cancelado" && (
+        <div className="mt-2 flex"><PagamentoInfo order={o} /></div>
+      )}
+
+      {isEntregaAtiva(o) && (
+        <div className={"mt-2 rounded-xl px-3 py-2 text-sm font-bold flex items-center gap-2 " + (o.status === "em_rota" ? "bg-purple-600 text-white" : "bg-purple-100 text-purple-800 border-2 border-purple-300")}>
+          <Bike size={16} className="shrink-0" />
+          {o.status === "em_rota" ? "Entregador saiu para entrega" : "Pronto — enviado ao entregador"}
+        </div>
+      )}
+
+      {o.status === "pronto_retirada" && (
+        <div className="mt-2 rounded-xl px-3 py-2 text-sm font-bold flex items-center gap-2 bg-teal-50 text-teal-900 border-2 border-teal-300">
+          <ShoppingBag size={16} className="shrink-0" /> Pronto {o.readyAt ? relTime(o.readyAt, nowTs) : ""} — aguardando o cliente buscar
+        </div>
+      )}
+
+      <p className={"mt-2 text-sm " + (o.status === "cancelado" ? "line-through text-slate-400" : "text-slate-600")}>{flatSummary(o)}</p>
+      {o.observacoes.trim() && (
+        <p className="mt-1 text-sm text-red-600 flex items-start gap-1"><AlertTriangle size={14} className="mt-0.5 shrink-0" /> {o.observacoes}</p>
+      )}
+
+      {o.status === "pronto_retirada" && (
+        <button onClick={() => onPickup(o.id)} className="mt-3 w-full rounded-xl font-extrabold text-lg bg-teal-600 text-white flex items-center justify-center gap-2 active:bg-teal-700" style={{ minHeight: "58px" }}>
+          <CheckCircle2 size={22} /> {aReceber(o) ? `RECEBER ${fmtBRL(o.valor)} E ENTREGAR` : "CLIENTE RETIROU"}
+        </button>
+      )}
+
+      <div className="mt-3 grid grid-cols-3 gap-2">
+        {cancelavel(o) ? (
+          <button onClick={() => { onEdit(o); setSub("novo"); }} className="rounded-xl border-2 border-amber-300 text-amber-700 font-bold flex items-center justify-center gap-1" style={{ minHeight: "46px" }}>
+            <Check size={16} /> Editar
+          </button>
+        ) : <div />}
+        <button onClick={() => { onRepeat(o); setSub("novo"); }} className="rounded-xl border-2 border-emerald-200 text-emerald-700 font-bold flex items-center justify-center gap-1" style={{ minHeight: "46px" }}>
+          <Copy size={16} /> Repetir
+        </button>
+        {cancelavel(o) ? (
+          confirmingId === o.id ? (
+            <div className="flex gap-1">
+              <button onClick={() => { onCancel(o.id); setConfirmingId(null); }} className="flex-1 rounded-xl bg-red-600 text-white font-bold text-sm" style={{ minHeight: "46px" }}>Sim</button>
+              <button onClick={() => setConfirmingId(null)} className="flex-1 rounded-xl bg-slate-200 text-slate-700 font-bold text-sm" style={{ minHeight: "46px" }}>Não</button>
+            </div>
+          ) : (
+            <button onClick={() => setConfirmingId(o.id)} className="rounded-xl border-2 border-red-200 text-red-600 font-bold flex items-center justify-center gap-1" style={{ minHeight: "46px" }}>
+              <Trash2 size={16} /> Cancelar
+            </button>
+          )
+        ) : <div />}
+      </div>
+      {o.status !== "cancelado" && (
+        <div className="mt-2 grid grid-cols-2 gap-2">
+          <button onClick={() => onShowLink(o)} className="rounded-xl bg-sky-600 text-white font-bold text-sm flex items-center justify-center gap-1 active:bg-sky-700" style={{ minHeight: "46px" }}>
+            <QrCode size={16} /> Link do cliente
+          </button>
+          <button onClick={() => { onMore(o); setSub("novo"); }} className="rounded-xl border-2 border-sky-200 text-sky-700 font-bold text-sm flex items-center justify-center gap-1" style={{ minHeight: "46px" }}>
+            <Plus size={16} /> Mais um p/ {(o.nome || "").trim().split(" ")[0]}
+          </button>
+        </div>
+      )}
+    </div>
+  );
 
   return (
     <div>
@@ -724,13 +1162,26 @@ function AtendenteView({ orders, menu, prefill, formSeed, nowTs, headerH, onCrea
           <Tab active={sub === "novo"} onClick={() => setSub("novo")} icon={<Plus size={18} />}>Novo Pedido</Tab>
           <Tab active={sub === "enviados"} onClick={() => setSub("enviados")} icon={<ClipboardList size={18} />} count={activeCount}>Enviados</Tab>
         </div>
+        {sub === "novo" && prontos.length > 0 && (
+          <button onClick={() => setSub("enviados")} className="mt-2 w-full rounded-xl bg-teal-600 text-white font-bold text-sm flex items-center justify-center gap-2 animate-pulse" style={{ minHeight: "44px" }}>
+            <ShoppingBag size={16} /> {prontos.length} pronto(s) para retirada — ver
+          </button>
+        )}
       </div>
 
       {sub === "novo" ? (
-        <OrderForm key={formSeed} menu={menu} initial={prefill} onSubmit={onCreate} onConsumedPrefill={onConsumedPrefill} />
+        <OrderForm key={formSeed} menu={menu} orders={orders} initial={prefill} onSubmit={onCreate} onConsumedPrefill={onConsumedPrefill} />
       ) : (
         <div className="p-4 space-y-4">
           {recent.length === 0 && <Empty>Nenhum pedido enviado ainda.</Empty>}
+          {prontos.length > 0 && (
+            <div className="rounded-2xl bg-teal-50 border-2 border-teal-300 p-2 space-y-2">
+              <div className="flex items-center gap-2 px-1 pt-1 text-teal-900 font-extrabold text-sm uppercase tracking-wide">
+                <ShoppingBag size={16} /> Prontos para retirada ({prontos.length})
+              </div>
+              {prontos.map(card)}
+            </div>
+          )}
           {groups.map((g) => (
             <div key={g.nome + g.items[0].id} className={g.items.length > 1 ? "rounded-2xl bg-slate-100 border-2 border-slate-200 p-2 space-y-2" : ""}>
               {g.items.length > 1 && (
@@ -739,72 +1190,7 @@ function AtendenteView({ orders, menu, prefill, formSeed, nowTs, headerH, onCrea
                   <span className="text-xs font-bold text-slate-500">{g.items.length} pedidos</span>
                 </div>
               )}
-              {g.items.map((o) => (
-                <div key={o.id} className="rounded-2xl border-2 border-slate-200 bg-white p-4">
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-2 min-w-0 flex-wrap">
-                      <div className="rounded-lg bg-slate-900 text-white px-3 py-1 font-extrabold text-lg truncate" style={{ maxWidth: "170px" }}>{o.nome}</div>
-                      <StatusBadge status={o.status} />
-                      {o.edited && <span className="rounded-full bg-amber-100 text-amber-800 text-xs font-bold px-2 py-0.5">EDITADO</span>}
-                    </div>
-                    <div className="text-xs text-slate-400 shrink-0">{relTime(o.createdAt, nowTs)}</div>
-                  </div>
-
-                  <div className="mt-2 flex flex-wrap items-center gap-2">
-                    <TipoBadge tipo={o.tipo} size="sm" />
-                    {o.horario && (
-                      <span className="text-xs font-semibold text-indigo-700 flex items-center gap-1">
-                        <Timer size={12} /> {o.tipo === "entrega" ? "Entregar" : "Servir"} {o.horario}
-                      </span>
-                    )}
-                  </div>
-
-                  {o.tipo === "entrega" && enderecoCompleto(o) && (
-                    <p className="mt-2 text-xs text-slate-500 flex items-start gap-1">
-                      <MapPin size={13} className="mt-0.5 shrink-0" /> {enderecoCompleto(o)}
-                    </p>
-                  )}
-
-                  {o.tipo === "entrega" && o.status !== "cancelado" && (
-                    <div className="mt-2 flex"><PagamentoInfo order={o} /></div>
-                  )}
-
-                  {isEntregaAtiva(o) && (
-                    <div className={"mt-2 rounded-xl px-3 py-2 text-sm font-bold flex items-center gap-2 " + (o.status === "em_rota" ? "bg-purple-600 text-white" : "bg-purple-100 text-purple-800 border-2 border-purple-300")}>
-                      <Bike size={16} className="shrink-0" />
-                      {o.status === "em_rota" ? "Entregador saiu para entrega" : "Pronto — enviado ao entregador"}
-                    </div>
-                  )}
-
-                  <p className={"mt-2 text-sm " + (o.status === "cancelado" ? "line-through text-slate-400" : "text-slate-600")}>{flatSummary(o)}</p>
-                  {o.observacoes.trim() && (
-                    <p className="mt-1 text-sm text-red-600 flex items-start gap-1"><AlertTriangle size={14} className="mt-0.5 shrink-0" /> {o.observacoes}</p>
-                  )}
-
-                  <div className="mt-3 grid grid-cols-3 gap-2">
-                    {cancelavel(o) ? (
-                      <button onClick={() => { onEdit(o); setSub("novo"); }} className="rounded-xl border-2 border-amber-300 text-amber-700 font-bold flex items-center justify-center gap-1" style={{ minHeight: "46px" }}>
-                        <Check size={16} /> Editar
-                      </button>
-                    ) : <div />}
-                    <button onClick={() => { onRepeat(o); setSub("novo"); }} className="rounded-xl border-2 border-emerald-200 text-emerald-700 font-bold flex items-center justify-center gap-1" style={{ minHeight: "46px" }}>
-                      <Copy size={16} /> Repetir
-                    </button>
-                    {cancelavel(o) ? (
-                      confirmingId === o.id ? (
-                        <div className="flex gap-1">
-                          <button onClick={() => { onCancel(o.id); setConfirmingId(null); }} className="flex-1 rounded-xl bg-red-600 text-white font-bold text-sm" style={{ minHeight: "46px" }}>Sim</button>
-                          <button onClick={() => setConfirmingId(null)} className="flex-1 rounded-xl bg-slate-200 text-slate-700 font-bold text-sm" style={{ minHeight: "46px" }}>Não</button>
-                        </div>
-                      ) : (
-                        <button onClick={() => setConfirmingId(o.id)} className="rounded-xl border-2 border-red-200 text-red-600 font-bold flex items-center justify-center gap-1" style={{ minHeight: "46px" }}>
-                          <Trash2 size={16} /> Cancelar
-                        </button>
-                      )
-                    ) : <div />}
-                  </div>
-                </div>
-              ))}
+              {g.items.map(card)}
             </div>
           ))}
         </div>
@@ -817,10 +1203,28 @@ function AtendenteView({ orders, menu, prefill, formSeed, nowTs, headerH, onCrea
 /*  Card + Visão Cozinha                                               */
 /* ================================================================== */
 
-function KitchenCard({ order, nowTs, variant, highlight, onPrepare, onComplete, onSkip, onBackToQueue, onSendToDelivery }) {
+/* Conteúdo embaçado com um botão grande na frente.
+   Obriga a etapa a ser marcada (Preparar / Sair para entrega) para ver os detalhes,
+   e assim o cliente acompanha em tempo real. */
+function Embacado({ ativo, botao, resumo, children }) {
+  if (!ativo) return children;
+  return (
+    <div className="relative mt-1" style={{ minHeight: "150px" }}>
+      <div aria-hidden="true" style={{ filter: "blur(7px)", opacity: 0.55, pointerEvents: "none", userSelect: "none" }}>{children}</div>
+      <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-2">
+        {botao}
+        {resumo && <div className="rounded-full bg-white/90 text-slate-700 text-xs font-bold px-3 py-1 shadow-sm text-center">{resumo}</div>}
+      </div>
+    </div>
+  );
+}
+
+function KitchenCard({ order, nowTs, variant, highlight, onPrepare, onComplete, onSkip, onBackToQueue, onSendToDelivery, onReadyPickup }) {
   const preparing = order.status === "preparando";
+  const bloqueado = variant === "fila" && !preparing;
   const comBebida = temBebida(order);
   const paraEntrega = order.tipo === "entrega";
+  const paraRetirada = order.tipo === "retirada";
   const isNew = variant === "fila" && nowTs - order.createdAt < 20000;
   const hInfo = horarioInfo(order, nowTs);
   const urgente = variant === "fila" && hInfo && hInfo.level === "urgente";
@@ -875,6 +1279,13 @@ function KitchenCard({ order, nowTs, variant, highlight, onPrepare, onComplete, 
         </div>
       )}
 
+      <Embacado ativo={bloqueado}
+        botao={
+          <button onClick={() => onPrepare(order.id)} className="w-full rounded-2xl font-extrabold text-xl bg-blue-600 text-white flex items-center justify-center gap-2 shadow-lg active:bg-blue-700" style={{ minHeight: "70px", maxWidth: "340px" }}>
+            <ChefHat size={26} /> PREPARAR
+          </button>
+        }
+        resumo={`Toque para ver os itens · ${order.itens.reduce((t, g) => t + g.valores.length, 0)} item(ns)${comBebida ? " · com bebida" : ""}${order.observacoes.trim() ? " · tem observação" : ""}`}>
       <div className="space-y-3">
         {order.itens.length ? (
           order.itens.map((g, i) => {
@@ -915,22 +1326,32 @@ function KitchenCard({ order, nowTs, variant, highlight, onPrepare, onComplete, 
           <p className="text-red-800 font-semibold">{order.observacoes}</p>
         </div>
       )}
+      </Embacado>
 
       <div className="mt-4">
-        {variant === "fila" && (
+        {variant === "fila" && bloqueado && (
+          <button onClick={() => onSkip(order.id)} className="w-full rounded-xl font-bold border-2 border-amber-400 text-amber-700 flex items-center justify-center gap-2" style={{ minHeight: "46px" }}>
+            <SkipForward size={18} /> Pular
+          </button>
+        )}
+        {variant === "fila" && !bloqueado && (
           <div className="space-y-2">
             <div className="grid grid-cols-2 gap-2">
               <button onClick={() => onPrepare(order.id)}
-                className={"rounded-xl font-bold flex items-center justify-center gap-2 " + (preparing ? "bg-blue-600 text-white" : "bg-blue-50 text-blue-700 border-2 border-blue-200")} style={{ minHeight: "52px" }}>
-                <ChefHat size={20} /> {preparing ? "Em preparo" : "Preparar"}
+                className="rounded-xl font-bold flex items-center justify-center gap-2 border-2 border-slate-300 text-slate-600 text-sm" style={{ minHeight: "46px" }}>
+                <Undo2 size={18} /> Voltar p/ fila
               </button>
-              <button onClick={() => onSkip(order.id)} className="rounded-xl font-bold bg-amber-500 text-white flex items-center justify-center gap-2 active:bg-amber-600" style={{ minHeight: "52px" }}>
-                <SkipForward size={20} /> Pular
+              <button onClick={() => onSkip(order.id)} className="rounded-xl font-bold border-2 border-amber-400 text-amber-700 flex items-center justify-center gap-2 text-sm" style={{ minHeight: "46px" }}>
+                <SkipForward size={18} /> Pular
               </button>
             </div>
             {paraEntrega ? (
               <button onClick={() => onSendToDelivery && onSendToDelivery(order.id)} className="w-full rounded-xl font-extrabold text-lg bg-purple-600 text-white flex items-center justify-center gap-2 active:bg-purple-700" style={{ minHeight: "58px" }}>
                 <Bike size={22} /> PRONTO → ENVIAR AO ENTREGADOR
+              </button>
+            ) : paraRetirada ? (
+              <button onClick={() => onReadyPickup && onReadyPickup(order.id)} className="w-full rounded-xl font-extrabold text-lg bg-teal-600 text-white flex items-center justify-center gap-2 active:bg-teal-700" style={{ minHeight: "58px" }}>
+                <ShoppingBag size={22} /> PRONTO → AVISAR RETIRADA
               </button>
             ) : (
               <button onClick={() => onComplete(order.id)} className="w-full rounded-xl font-extrabold text-lg bg-green-600 text-white flex items-center justify-center gap-2 active:bg-green-700" style={{ minHeight: "58px" }}>
@@ -953,6 +1374,10 @@ function KitchenCard({ order, nowTs, variant, highlight, onPrepare, onComplete, 
               {paraEntrega ? (
                 <button onClick={() => onSendToDelivery && onSendToDelivery(order.id)} className="rounded-xl font-extrabold bg-purple-600 text-white flex items-center justify-center gap-2 active:bg-purple-700" style={{ minHeight: "56px" }}>
                   <Bike size={20} /> Ao entregador
+                </button>
+              ) : paraRetirada ? (
+                <button onClick={() => onReadyPickup && onReadyPickup(order.id)} className="rounded-xl font-extrabold bg-teal-600 text-white flex items-center justify-center gap-2 active:bg-teal-700" style={{ minHeight: "56px" }}>
+                  <ShoppingBag size={20} /> Pronto p/ retirar
                 </button>
               ) : (
                 <button onClick={() => onComplete(order.id)} className="rounded-xl font-extrabold bg-green-600 text-white flex items-center justify-center gap-2 active:bg-green-700" style={{ minHeight: "56px" }}>
@@ -977,18 +1402,19 @@ function gerarRelatorioPDF(entregues) {
   const rows = [...entregues].sort((a, b) => (a.completedAt || 0) - (b.completedAt || 0));
   const now = new Date();
   const dataStr = now.toLocaleDateString("pt-BR", { weekday: "long", day: "2-digit", month: "long", year: "numeric" });
-  const totalLocal = rows.filter((o) => o.tipo !== "entrega").length;
+  const totalLocal = rows.filter((o) => o.tipo !== "entrega" && o.tipo !== "retirada").length;
+  const totalRetirada = rows.filter((o) => o.tipo === "retirada").length;
   const totalEntrega = rows.filter((o) => o.tipo === "entrega").length;
   const totalRecebido = rows.filter((o) => aReceber(o) && o.recebidoAt).reduce((t, o) => t + o.valor, 0);
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
   const trs = rows.map((o, i) => `<tr>
       <td class="c">${i + 1}</td>
       <td><b>${esc(o.nome)}</b></td>
-      <td class="c">${o.tipo === "entrega" ? "🚲 Entrega" : "🏠 Local"}</td>
+      <td class="c">${tipoInfo(o.tipo).emoji} ${tipoInfo(o.tipo).curto}</td>
       <td class="c">${o.horario ? esc(o.horario) : "—"}</td>
       <td>${esc(flatSummary(o))}</td>
       <td class="end">${o.tipo === "entrega" ? esc(enderecoCompleto(o)) : "—"}</td>
-      <td>${o.tipo === "entrega" ? esc(pagamentoResumo(o)) : "—"}</td>
+      <td>${esc(pagamentoResumo(o)) || "—"}</td>
       <td class="obs">${esc(o.observacoes || "")}</td>
       <td class="c">${fmtHM(o.completedAt)}</td>
     </tr>`).join("");
@@ -1012,9 +1438,10 @@ function gerarRelatorioPDF(entregues) {
     <div class="sub">${esc(dataStr)} · gerado às ${pad2(now.getHours())}:${pad2(now.getMinutes())}</div>
     <div class="cards">
       <div class="kpi"><b>${rows.length}</b><span>Pratos entregues</span></div>
-      <div class="kpi"><b>${totalLocal}</b><span>No local</span></div>
+      <div class="kpi"><b>${totalLocal}</b><span>Refeição na igreja</span></div>
+      <div class="kpi"><b>${totalRetirada}</b><span>Retiradas</span></div>
       <div class="kpi"><b>${totalEntrega}</b><span>Entregas</span></div>
-      <div class="kpi"><b>${esc(fmtBRL(totalRecebido))}</b><span>Recebido nas entregas</span></div>
+      <div class="kpi"><b>${esc(fmtBRL(totalRecebido))}</b><span>Recebido (entregas e retiradas)</span></div>
     </div>
     <table><thead><tr><th>#</th><th>Cliente</th><th>Tipo</th><th>Horário</th><th>Itens</th><th>Endereço</th><th>Pagamento</th><th>Observações</th><th>Concluído</th></tr></thead>
     <tbody>${trs || '<tr><td colspan="9" class="c">Nenhum pedido.</td></tr>'}</tbody></table>
@@ -1032,6 +1459,7 @@ function BebidaModal({ pending, onConfirm, onCancel }) {
   const { order, acao } = pending;
   const bebidas = bebidasDoPedido(order);
   const entrega = acao === "entregador";
+  const retirada = acao === "retirada";
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: "rgba(0,0,0,0.55)" }}>
       <div className="w-full rounded-2xl bg-white p-5 shadow-xl" style={{ maxWidth: "420px" }}>
@@ -1039,7 +1467,7 @@ function BebidaModal({ pending, onConfirm, onCancel }) {
           <Coffee size={24} /> Não esqueça a bebida!
         </div>
         <p className="text-sm text-slate-600 mt-1">
-          O pedido de <b>{order.nome}</b> tem bebida. Confira antes de {entrega ? "enviar ao entregador" : "concluir"}:
+          O pedido de <b>{order.nome}</b> tem bebida. Confira antes de {entrega ? "enviar ao entregador" : retirada ? "separar para a retirada" : "concluir"}:
         </p>
         <div className="mt-3 rounded-xl border-4 border-cyan-500 bg-cyan-50 p-3 flex flex-wrap gap-2">
           {bebidas.map((b, i) => (
@@ -1050,8 +1478,8 @@ function BebidaModal({ pending, onConfirm, onCancel }) {
           <button onClick={onCancel} className="rounded-xl bg-slate-200 text-slate-700 font-bold" style={{ minHeight: "54px" }}>
             Ainda não
           </button>
-          <button onClick={onConfirm} className={"rounded-xl text-white font-extrabold flex items-center justify-center gap-2 " + (entrega ? "bg-purple-600 active:bg-purple-700" : "bg-green-600 active:bg-green-700")} style={{ minHeight: "54px" }}>
-            {entrega ? <><Bike size={20} /> Bebida ok, enviar</> : <><CheckCircle2 size={20} /> Bebida ok, concluir</>}
+          <button onClick={onConfirm} className={"rounded-xl text-white font-extrabold flex items-center justify-center gap-2 " + (entrega ? "bg-purple-600 active:bg-purple-700" : retirada ? "bg-teal-600 active:bg-teal-700" : "bg-green-600 active:bg-green-700")} style={{ minHeight: "54px" }}>
+            {entrega ? <><Bike size={20} /> Bebida ok, enviar</> : retirada ? <><ShoppingBag size={20} /> Bebida ok, pronto</> : <><CheckCircle2 size={20} /> Bebida ok, concluir</>}
           </button>
         </div>
       </div>
@@ -1059,7 +1487,7 @@ function BebidaModal({ pending, onConfirm, onCancel }) {
   );
 }
 
-function CozinhaView({ orders, nowTs, headerH, onPrepare, onComplete, onSkip, onBackToQueue, onClearHistory, onSendToDelivery }) {
+function CozinhaView({ orders, nowTs, headerH, onPrepare, onComplete, onSkip, onBackToQueue, onClearHistory, onSendToDelivery, onReadyPickup, onPickup }) {
   const [tab, setTab] = useState("fila");
   const [highlightId, setHighlightId] = useState(null);
   const [pendingBebida, setPendingBebida] = useState(null);
@@ -1068,15 +1496,16 @@ function CozinhaView({ orders, nowTs, headerH, onPrepare, onComplete, onSkip, on
   const guardBebida = (acao) => (id) => {
     const o = orders.find((x) => x.id === id);
     if (o && temBebida(o)) { setPendingBebida({ order: o, acao }); return; }
-    if (acao === "entregador") onSendToDelivery(id); else onComplete(id);
+    if (acao === "entregador") onSendToDelivery(id); else if (acao === "retirada") onReadyPickup(id); else onComplete(id);
   };
   const completeGuard = guardBebida("concluir");
   const deliveryGuard = guardBebida("entregador");
+  const pickupGuard = guardBebida("retirada");
   const confirmBebida = () => {
     const p = pendingBebida;
     setPendingBebida(null);
     if (!p) return;
-    if (p.acao === "entregador") onSendToDelivery(p.order.id); else onComplete(p.order.id);
+    if (p.acao === "entregador") onSendToDelivery(p.order.id); else if (p.acao === "retirada") onReadyPickup(p.order.id); else onComplete(p.order.id);
   };
 
   const fila = orders.filter((o) => o.status === "na_fila" || o.status === "preparando").sort((a, b) => targetTs(a, nowTs) - targetTs(b, nowTs));
@@ -1084,7 +1513,7 @@ function CozinhaView({ orders, nowTs, headerH, onPrepare, onComplete, onSkip, on
   const concluidos = orders.filter((o) => o.status === "concluido").sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0));
   /* A cozinha continua vendo o pedido depois de enviá-lo ao entregador. */
   const entregues = orders
-    .filter((o) => o.status === "concluido" || isEntregaAtiva(o))
+    .filter((o) => o.status === "concluido" || isEntregaAtiva(o) || o.status === "pronto_retirada")
     .sort((a, b) => (b.completedAt || b.outAt || b.readyAt || 0) - (a.completedAt || a.outAt || a.readyAt || 0));
 
   const filaGroups = groupByClient(fila);
@@ -1121,7 +1550,7 @@ function CozinhaView({ orders, nowTs, headerH, onPrepare, onComplete, onSkip, on
                   const rel = h.diffMin <= 0 ? `ATRASADO ${Math.abs(h.diffMin)} min` : `em ${h.diffMin} min`;
                   return (
                     <button key={o.id} onClick={() => irParaPedido(o.id)} className="w-full text-left rounded-lg bg-white/15 active:bg-white/25 px-3 py-2 flex items-center justify-between gap-2">
-                      <span className="font-bold truncate">{o.tipo === "entrega" ? "🚲 " : ""}{o.nome}</span>
+                      <span className="font-bold truncate">{o.tipo !== "local" ? tipoInfo(o.tipo).emoji + " " : ""}{o.nome}</span>
                       <span className="text-sm font-extrabold shrink-0">{o.horario} · {rel}</span>
                     </button>
                   );
@@ -1141,14 +1570,14 @@ function CozinhaView({ orders, nowTs, headerH, onPrepare, onComplete, onSkip, on
                 <span className="rounded-lg bg-slate-900 text-white px-3 py-1 font-extrabold">{g.nome}</span>
                 <span className="text-xs font-bold text-slate-500">{g.items.length} pedidos deste cliente</span>
               </div>
-              {g.items.map((o) => <KitchenCard key={o.id} order={o} nowTs={nowTs} variant="fila" highlight={highlightId === o.id} onPrepare={onPrepare} onComplete={completeGuard} onSkip={onSkip} onSendToDelivery={deliveryGuard} />)}
+              {g.items.map((o) => <KitchenCard key={o.id} order={o} nowTs={nowTs} variant="fila" highlight={highlightId === o.id} onPrepare={onPrepare} onComplete={completeGuard} onSkip={onSkip} onSendToDelivery={deliveryGuard} onReadyPickup={pickupGuard} />)}
             </div>
           ) : (
-            <KitchenCard key={g.items[0].id} order={g.items[0]} nowTs={nowTs} variant="fila" highlight={highlightId === g.items[0].id} onPrepare={onPrepare} onComplete={completeGuard} onSkip={onSkip} onSendToDelivery={deliveryGuard} />
+            <KitchenCard key={g.items[0].id} order={g.items[0]} nowTs={nowTs} variant="fila" highlight={highlightId === g.items[0].id} onPrepare={onPrepare} onComplete={completeGuard} onSkip={onSkip} onSendToDelivery={deliveryGuard} onReadyPickup={pickupGuard} />
           )
         )) : <Empty>Nenhum pedido na fila. Tudo em dia! 🎉</Empty>)}
 
-        {tab === "pulados" && (pulados.length ? pulados.map((o) => <KitchenCard key={o.id} order={o} nowTs={nowTs} variant="pulado" onComplete={completeGuard} onBackToQueue={onBackToQueue} onSendToDelivery={deliveryGuard} />) : <Empty>Nenhum pedido aguardando.</Empty>)}
+        {tab === "pulados" && (pulados.length ? pulados.map((o) => <KitchenCard key={o.id} order={o} nowTs={nowTs} variant="pulado" onComplete={completeGuard} onBackToQueue={onBackToQueue} onSendToDelivery={deliveryGuard} onReadyPickup={pickupGuard} />) : <Empty>Nenhum pedido aguardando.</Empty>)}
 
         {tab === "entregues" && (entregues.length ? (
           <>
@@ -1157,14 +1586,15 @@ function CozinhaView({ orders, nowTs, headerH, onPrepare, onComplete, onSkip, on
             </button>
             {entregues.map((o) => {
               const emEntrega = isEntregaAtiva(o);
+              const aguardaRetirada = o.status === "pronto_retirada";
               return (
-                <div key={o.id} className={"rounded-2xl border-2 bg-white p-4 " + (emEntrega ? "border-purple-300" : "border-slate-200")}>
+                <div key={o.id} className={"rounded-2xl border-2 bg-white p-4 " + (emEntrega ? "border-purple-300" : aguardaRetirada ? "border-teal-400" : "border-slate-200")}>
                   <div className="flex items-center justify-between gap-2">
-                    <div className={"rounded-lg text-white px-3 py-1 font-extrabold text-lg flex items-center gap-1 truncate " + (emEntrega ? "bg-purple-600" : "bg-green-600")} style={{ maxWidth: "200px" }}>
-                      {emEntrega ? <Bike size={18} /> : <CheckCircle2 size={18} />} {o.nome}
+                    <div className={"rounded-lg text-white px-3 py-1 font-extrabold text-lg flex items-center gap-1 truncate " + (emEntrega ? "bg-purple-600" : aguardaRetirada ? "bg-teal-600" : "bg-green-600")} style={{ maxWidth: "200px" }}>
+                      {emEntrega ? <Bike size={18} /> : aguardaRetirada ? <ShoppingBag size={18} /> : <CheckCircle2 size={18} />} {o.nome}
                     </div>
                     <div className="text-xs text-slate-400 shrink-0">
-                      {emEntrega ? relTime(o.outAt || o.readyAt || o.createdAt, nowTs) : `Entregue ${relTime(o.completedAt || o.createdAt, nowTs)}`}
+                      {emEntrega || aguardaRetirada ? relTime(o.outAt || o.readyAt || o.createdAt, nowTs) : `Entregue ${relTime(o.completedAt || o.createdAt, nowTs)}`}
                     </div>
                   </div>
                   <div className="mt-2 flex flex-wrap gap-2 items-center">
@@ -1174,9 +1604,15 @@ function CozinhaView({ orders, nowTs, headerH, onPrepare, onComplete, onSkip, on
                         {o.status === "em_rota" ? "SAIU PARA ENTREGA" : "COM O ENTREGADOR"}
                       </span>
                     )}
+                    {aguardaRetirada && <span className="rounded-full bg-teal-100 text-teal-800 text-xs font-bold px-2 py-0.5">AGUARDANDO RETIRADA</span>}
                     {temBebida(o) && <span className="rounded-full bg-cyan-600 text-white text-xs font-bold px-2 py-0.5">🥤 COM BEBIDA</span>}
                   </div>
                   <p className="mt-2 text-sm text-slate-600">{flatSummary(o)}</p>
+                  {aguardaRetirada && (
+                    <button onClick={() => onPickup(o.id)} className="mt-2 w-full rounded-xl border-2 border-teal-500 text-teal-700 font-bold flex items-center justify-center gap-2" style={{ minHeight: "46px" }}>
+                      <CheckCircle2 size={18} /> Cliente retirou{aReceber(o) ? ` · receber ${fmtBRL(o.valor)}` : ""}
+                    </button>
+                  )}
                 </div>
               );
             })}
@@ -1203,6 +1639,7 @@ function EntregaCard({ order, nowTs, variant, onStartRoute, onDelivered, onBackT
   const comBebida = temBebida(order);
   const end = (order.endereco || "").trim();
   const [confirmVolta, setConfirmVolta] = useState(false);
+  const bloqueado = variant !== "entregue" && !emRota;
 
   const tone = variant === "entregue"
     ? "border-slate-200 bg-white"
@@ -1247,7 +1684,10 @@ function EntregaCard({ order, nowTs, variant, onStartRoute, onDelivered, onBackT
         )}
       </div>
 
-      {variant !== "entregue" && end && (
+      {variant !== "entregue" && !emRota && (
+        <p className="mt-2 text-xs font-semibold text-slate-500 text-center">Maps, Waze, pagamento e itens aparecem ao tocar em <b>SAIR PARA ENTREGA</b>.</p>
+      )}
+      {variant !== "entregue" && emRota && end && (
         <div className="mt-2 grid grid-cols-3 gap-2">
           <a href={mapsUrl(order)} target="_blank" rel="noopener noreferrer"
             className="rounded-xl bg-emerald-600 text-white font-bold text-sm flex items-center justify-center gap-1 active:bg-emerald-700" style={{ minHeight: "50px" }}>
@@ -1264,6 +1704,13 @@ function EntregaCard({ order, nowTs, variant, onStartRoute, onDelivered, onBackT
         </div>
       )}
 
+      <Embacado ativo={bloqueado}
+        botao={
+          <button onClick={() => onStartRoute(order.id)} className="w-full rounded-2xl font-extrabold text-xl bg-purple-600 text-white flex items-center justify-center gap-2 shadow-lg active:bg-purple-700" style={{ minHeight: "70px", maxWidth: "340px" }}>
+            <Bike size={26} /> SAIR PARA ENTREGA
+          </button>
+        }
+        resumo={`Toque quando sair com o pedido${aReceber(order) ? ` · cobrar ${fmtBRL(order.valor)}` : ""}${comBebida ? " · com bebida" : ""}`}>
       <PagamentoInfo order={order} size="lg" />
 
       <div className="mt-3 space-y-3">
@@ -1292,14 +1739,11 @@ function EntregaCard({ order, nowTs, variant, onStartRoute, onDelivered, onBackT
           <p className="text-red-800 font-semibold">{order.observacoes}</p>
         </div>
       )}
+      </Embacado>
 
       {variant !== "entregue" && (
         <div className="mt-4 space-y-2">
-          {!emRota ? (
-            <button onClick={() => onStartRoute(order.id)} className="w-full rounded-xl font-extrabold text-lg bg-purple-600 text-white flex items-center justify-center gap-2 active:bg-purple-700" style={{ minHeight: "58px" }}>
-              <Bike size={22} /> SAIR PARA ENTREGA
-            </button>
-          ) : (
+          {emRota && (
             <button onClick={() => onDelivered(order.id)} className="w-full rounded-xl font-extrabold text-lg bg-green-600 text-white flex items-center justify-center gap-2 active:bg-green-700" style={{ minHeight: "58px" }}>
               <CheckCircle2 size={22} /> {aReceber(order) ? "RECEBER E ENTREGAR" : "ENTREGUE AO CLIENTE"}
             </button>
@@ -1322,6 +1766,7 @@ function EntregaCard({ order, nowTs, variant, onStartRoute, onDelivered, onBackT
 
 /* Confirma que o entregador recebeu o valor antes de concluir a entrega. */
 function RecebimentoModal({ order, onConfirm, onCancel }) {
+  const retirada = order && order.tipo === "retirada";
   if (!order) return null;
   const troco = trocoDe(order);
   return (
@@ -1341,7 +1786,7 @@ function RecebimentoModal({ order, onConfirm, onCancel }) {
             Ainda não
           </button>
           <button onClick={onConfirm} className="rounded-xl bg-green-600 text-white font-extrabold flex items-center justify-center gap-2 active:bg-green-700" style={{ minHeight: "54px" }}>
-            <CheckCircle2 size={20} /> Recebi, entregue
+            <CheckCircle2 size={20} /> {retirada ? "Recebi, retirado" : "Recebi, entregue"}
           </button>
         </div>
       </div>
@@ -1381,8 +1826,8 @@ function EntregadorView({ orders, nowTs, headerH, onStartRoute, onDelivered, onB
     : tab === "rota" ? "Você não está com nenhuma entrega em rota."
     : "Nenhuma entrega concluída ainda.";
 
-  /* Todos os endereços pendentes, para montar uma rota única no Maps */
-  const pendentes = [...emRota, ...aguardando].filter((o) => (o.endereco || "").trim());
+  /* Entregas em rota (já saíram), para montar uma rota única no Maps */
+  const pendentes = emRota.filter((o) => (o.endereco || "").trim());
   const rotaGeralUrl = pendentes.length > 1
     ? `https://www.google.com/maps/dir/?api=1&travelmode=driving&destination=${encodeURIComponent(pendentes[pendentes.length - 1].endereco.trim())}&waypoints=${pendentes.slice(0, -1).map((o) => encodeURIComponent(o.endereco.trim())).join("%7C")}`
     : null;
@@ -1398,7 +1843,7 @@ function EntregadorView({ orders, nowTs, headerH, onStartRoute, onDelivered, onB
       </div>
 
       <div className="p-4 space-y-4">
-        {tab !== "entregues" && rotaGeralUrl && (
+        {tab === "rota" && rotaGeralUrl && (
           <a href={rotaGeralUrl} target="_blank" rel="noopener noreferrer"
             className="w-full rounded-xl bg-slate-900 text-white font-bold flex items-center justify-center gap-2" style={{ minHeight: "50px" }}>
             <Navigation size={18} /> Rota com as {pendentes.length} entregas (Maps)
@@ -1433,7 +1878,94 @@ function EntregadorView({ orders, nowTs, headerH, onStartRoute, onDelivered, onB
 /*  Visão Administração (cardápios)                                    */
 /* ================================================================== */
 
-function AdminView({ menus, activeMenuId, onCreateMenu, onSaveMenu, onDeleteMenu, onSetActive }) {
+function NovoDiaCard({ orders, messagesCount, onClearAll }) {
+  const [confirmando, setConfirmando] = useState(false);
+  const concluidos = orders.filter((o) => o.status === "concluido");
+  const emAndamento = orders.filter((o) => !["concluido", "cancelado"].includes(o.status)).length;
+  const vazio = orders.length === 0 && messagesCount === 0;
+
+  return (
+    <div className="rounded-2xl border-2 border-red-200 bg-red-50 p-4">
+      <div className="flex items-center gap-2 font-bold text-red-800"><Trash2 size={18} /> Novo dia de vendas</div>
+      <p className="text-sm text-red-900/80 mt-1">
+        Apaga <b>todo o histórico</b> em todas as abas e em todos os aparelhos: pedidos (atendente, cozinha, entregador) e o chat.
+        Os cardápios <b>não</b> são apagados.
+      </p>
+      <button onClick={() => setConfirmando(true)} disabled={vazio}
+        className={"mt-3 w-full rounded-xl font-extrabold flex items-center justify-center gap-2 " + (vazio ? "bg-slate-200 text-slate-400" : "bg-red-600 text-white active:bg-red-700")} style={{ minHeight: "54px" }}>
+        <Trash2 size={20} /> {vazio ? "Nada para apagar" : `Apagar todo o histórico (${orders.length} pedido${orders.length === 1 ? "" : "s"})`}
+      </button>
+
+      {confirmando && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: "rgba(0,0,0,0.55)" }}>
+          <div className="w-full rounded-2xl bg-white p-5 shadow-xl" style={{ maxWidth: "420px" }}>
+            <div className="flex items-center gap-2 text-red-700 font-extrabold text-lg"><AlertTriangle size={24} /> Apagar tudo e começar um novo dia?</div>
+            <ul className="text-sm text-slate-700 mt-2 space-y-1">
+              <li>• {orders.length} pedido(s) serão apagados de todos os aparelhos</li>
+              {messagesCount > 0 && <li>• {messagesCount} mensagem(ns) do chat</li>}
+            </ul>
+            {emAndamento > 0 && (
+              <p className="mt-2 rounded-lg bg-amber-100 text-amber-900 text-sm font-bold p-2 flex items-start gap-2">
+                <AlertTriangle size={16} className="mt-0.5 shrink-0" /> Atenção: {emAndamento} pedido(s) ainda estão em andamento (fila, preparo ou entrega) e também serão apagados.
+              </p>
+            )}
+            <p className="text-xs text-slate-500 mt-2">Isso não pode ser desfeito. Se quiser guardar, gere o relatório antes.</p>
+            <button onClick={() => gerarRelatorioPDF(concluidos)} disabled={!concluidos.length}
+              className={"mt-3 w-full rounded-xl font-bold flex items-center justify-center gap-2 " + (concluidos.length ? "bg-slate-900 text-white" : "bg-slate-200 text-slate-400")} style={{ minHeight: "48px" }}>
+              <ClipboardList size={18} /> Gerar relatório (PDF) antes
+            </button>
+            <div className="mt-2 grid grid-cols-2 gap-2">
+              <button onClick={() => setConfirmando(false)} className="rounded-xl bg-slate-200 text-slate-700 font-bold" style={{ minHeight: "54px" }}>Cancelar</button>
+              <button onClick={() => { onClearAll(); setConfirmando(false); }} className="rounded-xl bg-red-600 text-white font-extrabold active:bg-red-700" style={{ minHeight: "54px" }}>Sim, apagar tudo</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* Configurações da página do cliente + sair deste aparelho */
+function ClienteConfigCard({ contato, onSaveContato, userEmail, onLogout }) {
+  const [v, setV] = useState(contato || "");
+  const [saiu, setSaiu] = useState(false);
+  useEffect(() => { setV(contato || ""); }, [contato]);
+  const mudou = (v || "").trim() !== (contato || "").trim();
+  return (
+    <div className="space-y-4">
+      <div className="rounded-2xl border-2 border-sky-200 bg-sky-50 p-4 space-y-2">
+        <div className="flex items-center gap-2 font-bold text-sky-900"><Link2 size={18} /> Página de acompanhamento do cliente</div>
+        <p className="text-sm text-sky-900/80">
+          Cada pedido tem um link (botão <b>Link do cliente</b> na aba Atendente). O cliente vê só os próprios pedidos, em tempo real.
+        </p>
+        <div className="text-xs font-semibold text-slate-600 pt-1">WhatsApp da igreja (aparece para o cliente tirar dúvidas)</div>
+        <div className="flex gap-2">
+          <input value={v} onChange={(e) => setV(e.target.value)} inputMode="tel" placeholder="Ex: 21 99999-8888"
+            className="flex-1 rounded-lg border-2 border-slate-200 px-3 py-2 outline-none focus:border-emerald-500 bg-white" />
+          <button onClick={() => onSaveContato(v.trim())} disabled={!mudou}
+            className={"rounded-lg font-bold px-4 " + (mudou ? "bg-emerald-600 text-white" : "bg-slate-200 text-slate-400")}>Salvar</button>
+        </div>
+        <a href={`${window.location.origin}/?p=TESTE`} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-sm font-semibold text-sky-700"><ExternalLink size={14} /> Ver a página do cliente (exemplo)</a>
+      </div>
+      <div className="rounded-2xl border-2 border-slate-200 bg-white p-4">
+        <div className="flex items-center gap-2 font-bold text-slate-800"><Lock size={18} /> Acesso da equipe</div>
+        <p className="text-sm text-slate-600 mt-1">Este aparelho está conectado{userEmail ? <> como <b>{userEmail}</b></> : ""}. Ele continua conectado mesmo fechando o app.</p>
+        {saiu ? (
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            <button onClick={() => setSaiu(false)} className="rounded-xl bg-slate-200 text-slate-700 font-bold" style={{ minHeight: "46px" }}>Cancelar</button>
+            <button onClick={onLogout} className="rounded-xl bg-red-600 text-white font-bold" style={{ minHeight: "46px" }}>Sim, sair</button>
+          </div>
+        ) : (
+          <button onClick={() => setSaiu(true)} className="mt-2 w-full rounded-xl border-2 border-slate-300 text-slate-600 font-bold flex items-center justify-center gap-2" style={{ minHeight: "46px" }}>
+            <LogOut size={16} /> Sair deste aparelho
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AdminView({ menus, activeMenuId, onCreateMenu, onSaveMenu, onDeleteMenu, onSetActive, orders, messagesCount, onClearAll, contato, onSaveContato, userEmail, onLogout }) {
   const [selectedId, setSelectedId] = useState(activeMenuId || (menus[0] && menus[0].id));
   const [draft, setDraft] = useState(null);
   const [dirty, setDirty] = useState(false);
@@ -1474,6 +2006,10 @@ function AdminView({ menus, activeMenuId, onCreateMenu, onSaveMenu, onDeleteMenu
         <div className="flex items-center gap-2 font-bold"><Settings size={18} /> Administração de cardápios</div>
         <p className="text-sm text-slate-300 mt-1">Configure os itens que o atendente pode marcar. O cardápio marcado como “EM USO” é o que aparece no formulário — troque conforme o dia.</p>
       </div>
+
+      <NovoDiaCard orders={orders} messagesCount={messagesCount} onClearAll={onClearAll} />
+
+      <ClienteConfigCard contato={contato} onSaveContato={onSaveContato} userEmail={userEmail} onLogout={onLogout} />
 
       <div className="space-y-2">
         <div className="text-sm font-bold text-slate-500 uppercase tracking-wide">Cardápios</div>
@@ -1616,6 +2152,44 @@ function ChatDrawer({ open, onClose, messages, role, onSend }) {
   );
 }
 
+/* Aviso central de chegada: some sozinho em 3 s ou ao tocar em OK.
+   Vários avisos seguidos do mesmo tipo se juntam num só, com todos os nomes. */
+const ALERTA_MS = 3000;
+const ALERTA_ESTILO = {
+  pedido:    { titulo: "NOVO PEDIDO!",   plural: "NOVOS PEDIDOS!",   cor: "bg-emerald-600", barra: "bg-emerald-600", icon: <ChefHat size={30} /> },
+  entrega:   { titulo: "NOVA ENTREGA!",  plural: "NOVAS ENTREGAS!",  cor: "bg-purple-600",  barra: "bg-purple-600",  icon: <Bike size={30} /> },
+  retirada:  { titulo: "PRONTO P/ RETIRADA", plural: "PRONTOS P/ RETIRADA", cor: "bg-teal-600", barra: "bg-teal-600", icon: <ShoppingBag size={30} /> },
+  devolvido: { titulo: "PEDIDO DEVOLVIDO", plural: "PEDIDOS DEVOLVIDOS", cor: "bg-amber-600", barra: "bg-amber-600", icon: <RotateCcw size={30} /> },
+};
+
+function AlertaPopup({ alerta, onClose }) {
+  if (!alerta) return null;
+  const st = ALERTA_ESTILO[alerta.tipo] || ALERTA_ESTILO.pedido;
+  const varios = alerta.nomes.length > 1;
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-6" style={{ backgroundColor: "rgba(0,0,0,0.35)" }} onClick={onClose}>
+      <div className="w-full rounded-2xl bg-white shadow-2xl overflow-hidden" style={{ maxWidth: "360px" }} onClick={(e) => e.stopPropagation()}>
+        <div className={"text-white px-5 py-4 flex items-center gap-3 " + st.cor}>
+          <Bell size={30} className="shrink-0 animate-pulse" />
+          <div className="text-2xl font-extrabold leading-tight">{varios ? `${alerta.nomes.length} ${st.plural}` : st.titulo}</div>
+        </div>
+        <div className="px-5 py-4">
+          <div className="flex items-center gap-2 text-slate-400 mb-1">{st.icon}</div>
+          {alerta.nomes.slice(-5).map((n, i) => (
+            <div key={i} className="text-xl font-extrabold text-slate-900 break-words">{n}</div>
+          ))}
+          {alerta.nomes.length > 5 && <div className="text-sm text-slate-500">+{alerta.nomes.length - 5} outro(s)</div>}
+          {alerta.detalhe && <div className="text-sm font-semibold text-slate-500 mt-1">{alerta.detalhe}</div>}
+          <button onClick={onClose} className={"mt-4 w-full rounded-xl text-white font-extrabold text-lg " + st.cor} style={{ minHeight: "54px" }}>OK</button>
+        </div>
+        <div className="h-1.5 w-full bg-slate-100">
+          <div key={alerta.seq} className={"h-full " + st.barra} style={{ animation: `undobar ${ALERTA_MS}ms linear forwards` }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Toasts({ toasts, onUndo }) {
   if (!toasts.length) return null;
   return (
@@ -1671,8 +2245,11 @@ function SetupNeeded() {
 /*  App com Supabase (tempo real)                                      */
 /* ================================================================== */
 
-function ComandaApp() {
+function ComandaApp({ session }) {
   const [view, setView] = useState("atendente");
+  const [contato, setContato] = useState("");
+  const [linkOrderId, setLinkOrderId] = useState(null);
+  const [cobrandoRet, setCobrandoRet] = useState(null);
   const [orders, setOrders] = useState([]);
   const [menus, setMenus] = useState([]);
   const [activeMenuId, setActiveMenuId] = useState(null);
@@ -1686,6 +2263,9 @@ function ComandaApp() {
   const [formSeed, setFormSeed] = useState(0);
   const [ready, setReady] = useState(false);
   const [connError, setConnError] = useState("");
+
+  const [alerta, setAlerta] = useState(null);
+  const alertaTimer = useRef(null);
 
   const audioRef = useRef(null);
   const timers = useRef({});
@@ -1729,6 +2309,21 @@ function ComandaApp() {
       });
     } catch (e) { /* ignore */ }
   };
+  /* Os navegadores (principalmente iPhone) só liberam o som depois de um toque
+     na tela. Criamos/retomamos o áudio a cada toque, para que os avisos que
+     chegam depois (sem toque) consigam tocar. */
+  useEffect(() => {
+    const unlock = () => {
+      try {
+        if (!audioRef.current) { const AC = window.AudioContext || window.webkitAudioContext; audioRef.current = new AC(); }
+        if (audioRef.current.state === "suspended") audioRef.current.resume();
+      } catch (e) { /* ignore */ }
+    };
+    const evs = ["pointerdown", "touchstart", "keydown"];
+    evs.forEach((ev) => window.addEventListener(ev, unlock, { passive: true }));
+    return () => evs.forEach((ev) => window.removeEventListener(ev, unlock));
+  }, []);
+
   const dingNewOrder = () => playTone([784, 1046, 1318], "triangle", 0.18);
   const chimeDone = () => playTone([880, 660], "sine", 0.16);
   const blipChat = () => playTone([1174], "sine", 0.12);
@@ -1736,6 +2331,19 @@ function ComandaApp() {
   /* Toasts */
   const removeToast = (id) => { setToasts((t) => t.filter((x) => x.id !== id)); const tm = timers.current[id]; if (tm) { clearTimeout(tm); delete timers.current[id]; } };
   const pushToast = (toast) => { const id = uid(); setToasts((t) => [...t, { ...toast, id }]); timers.current[id] = setTimeout(() => removeToast(id), toast.duration || 2500); };
+
+  /* Popup de chegada (cozinha / entregador) */
+  const fecharAlerta = () => { clearTimeout(alertaTimer.current); setAlerta(null); };
+  const mostrarAlerta = (tipo, nome, detalhe) => {
+    setAlerta((a) => (a && a.tipo === tipo
+      ? { ...a, nomes: [...a.nomes, nome], detalhe: "", seq: a.seq + 1 }
+      : { tipo, nomes: [nome], detalhe, seq: 0 }));
+    clearTimeout(alertaTimer.current);
+    alertaTimer.current = setTimeout(() => setAlerta(null), ALERTA_MS);
+  };
+  useEffect(() => () => clearTimeout(alertaTimer.current), []);
+  // O aviso é de quem está na aba: ao trocar de aba, ele some.
+  useEffect(() => { fecharAlerta(); }, [view]); // eslint-disable-line
 
   /* Atualizações idempotentes de estado */
   const upsertOrder = (o) => setOrders((prev) => { const i = prev.findIndex((x) => x.id === o.id); if (i === -1) return [...prev, o]; const cp = [...prev]; cp[i] = o; return cp; });
@@ -1765,6 +2373,7 @@ function ComandaApp() {
 
         setMenus((mRes.data || []).map(menuFromRow));
         setActiveMenuId((sRes.data && sRes.data.active_menu_id) || "menu_padrao");
+        setContato((sRes.data && sRes.data.whatsapp_contato) || "");
         setOrders((oRes.data || []).map(orderFromRow));
         setMessages((gRes.data || []).map(msgFromRow));
         setReady(true);
@@ -1774,13 +2383,29 @@ function ComandaApp() {
           .on("postgres_changes", { event: "*", schema: "public", table: "orders" }, (p) => {
             if (p.eventType === "DELETE") { removeOrder(p.old.id); return; }
             const o = orderFromRow(p.new); upsertOrder(o);
-            if (p.eventType === "INSERT" && roleRef.current === "cozinha") dingNewOrder();
+            const statusMudou = (st) => p.eventType === "UPDATE" && p.new.status === st && (!p.old || p.old.status !== st);
+            if (p.eventType === "INSERT" && roleRef.current === "cozinha") {
+              dingNewOrder();
+              mostrarAlerta("pedido", o.nome, `${tipoInfo(o.tipo).emoji} ${tipoInfo(o.tipo).curto}` + (o.horario ? ` · ${o.horario}` : ""));
+            }
+            if (statusMudou("na_fila") && p.old && ENTREGA_STATUS.includes(p.old.status) && roleRef.current === "cozinha") {
+              dingNewOrder();
+              mostrarAlerta("devolvido", o.nome, "O entregador devolveu para a cozinha");
+            }
             if (p.eventType === "UPDATE" && p.new.status === "concluido" && (!p.old || p.old.status !== "concluido") && roleRef.current === "atendente") chimeDone();
             if (p.eventType === "UPDATE" && p.new.recebido_at && (!p.old || !p.old.recebido_at) && roleRef.current === "atendente")
               pushToast({ type: "success", message: `Entregador recebeu ${fmtBRL(o.valor)} (${formaLabel(o.formaPagamento)}) de ${o.nome}`, duration: 4000 });
-            if (p.eventType === "UPDATE" && p.new.status === "aguardando_entrega" && (!p.old || p.old.status !== "aguardando_entrega") && roleRef.current === "entregador") dingNewOrder();
+            if (statusMudou("pronto_retirada") && roleRef.current === "atendente") {
+              dingNewOrder();
+              mostrarAlerta("retirada", o.nome, "Avise o cliente que pode buscar");
+            }
+            if (statusMudou("aguardando_entrega") && roleRef.current === "entregador") {
+              dingNewOrder();
+              mostrarAlerta("entrega", o.nome, (o.endereco || "").trim());
+            }
           })
           .on("postgres_changes", { event: "*", schema: "public", table: "messages" }, (p) => {
+            if (p.eventType === "DELETE") { setMessages((prev) => prev.filter((x) => x.id !== p.old.id)); return; }
             if (p.eventType !== "INSERT") return;
             const m = msgFromRow(p.new); upsertMessage(m);
             if (m.sender !== roleRef.current) blipChat();
@@ -1791,6 +2416,7 @@ function ComandaApp() {
           })
           .on("postgres_changes", { event: "*", schema: "public", table: "app_settings" }, (p) => {
             if (p.new && p.new.active_menu_id) setActiveMenuId(p.new.active_menu_id);
+            if (p.new && p.new.whatsapp_contato != null) setContato(p.new.whatsapp_contato || "");
           })
           .subscribe();
       } catch (e) {
@@ -1812,22 +2438,46 @@ function ComandaApp() {
   }, [nowTs, ready]); // eslint-disable-line
 
   /* Ações — atualização otimista + gravação no banco */
+  /* Código de acompanhamento: o que veio do app, ou o mesmo de outro pedido
+     com o mesmo WhatsApp, ou um novo. */
+  const resolverCodigo = (data, excetoId) => {
+    if (data.codigo) return data.codigo;
+    const tel = soDigitos(data.telefone);
+    if (tel.length >= 8) {
+      const m = orders.find((x) => x.id !== excetoId && x.codigo && soDigitos(x.telefone) === tel);
+      if (m) return m.codigo;
+    }
+    return novoCodigo();
+  };
+  /* Se o tipo mudar depois que a cozinha já terminou, o pedido vai para a etapa certa. */
+  const PRONTO_STATUS = ["aguardando_entrega", "em_rota", "pronto_retirada"];
+  const statusParaTipo = (cur, tipo) => {
+    if (cur.tipo === tipo || !PRONTO_STATUS.includes(cur.status)) return null;
+    if (tipo === "entrega") return { status: "aguardando_entrega", out_at: null };
+    if (tipo === "retirada") return { status: "pronto_retirada", out_at: null };
+    return { status: "concluido", completed_at: Date.now(), out_at: null };
+  };
+
   const createOrder = (data, editId) => {
     if (editId) {
       const cur = orders.find((x) => x.id === editId);
       if (!cur) return;
-      const upd = { ...cur, ...data, edited: true };
+      const codigo = data.codigo || cur.codigo || resolverCodigo(data, editId);
+      const mudanca = statusParaTipo(cur, data.tipo) || {};
+      const upd = { ...cur, ...data, codigo, edited: true,
+        ...(mudanca.status ? { status: mudanca.status, outAt: null, completedAt: mudanca.completed_at || cur.completedAt } : {}) };
       upsertOrder(upd);
       pushToast({ type: "success", message: `Pedido de ${data.nome} atualizado`, duration: 2500 });
       supabase.from("orders").update({
         nome: data.nome, tipo: data.tipo, horario: data.horario, observacoes: data.observacoes,
+        telefone: data.telefone || "", codigo,
         endereco: data.endereco || "", referencia: data.referencia || "",
         pagamento: data.pagamento || "", valor: data.valor, forma_pagamento: data.formaPagamento || "", troco_para: data.trocoPara,
-        itens: data.itens, selections: data.selections, edited: true,
+        itens: data.itens, selections: data.selections, edited: true, ...mudanca,
       }).eq("id", editId).then(({ error }) => dbFail(error));
       return;
     }
-    const o = { id: uid(), createdAt: Date.now(), completedAt: null, status: "na_fila", edited: false, skippedAt: null, ...data };
+    const o = { id: uid(), createdAt: Date.now(), completedAt: null, status: "na_fila", edited: false, skippedAt: null, ...data, codigo: resolverCodigo(data) };
     upsertOrder(o);
     pushToast({ type: "success", message: `Pedido de ${data.nome} enviado para a cozinha`, duration: 2500 });
     supabase.from("orders").insert(orderToRow(o)).then(({ error }) => dbFail(error));
@@ -1841,8 +2491,9 @@ function ComandaApp() {
   const prepareToggle = (id) => {
     const o = orders.find((x) => x.id === id); if (!o) return;
     const ns = o.status === "preparando" ? "na_fila" : "preparando";
-    upsertOrder({ ...o, status: ns });
-    supabase.from("orders").update({ status: ns }).eq("id", id).then(({ error }) => dbFail(error));
+    const preparoAt = ns === "preparando" ? (o.preparoAt || Date.now()) : o.preparoAt;
+    upsertOrder({ ...o, status: ns, preparoAt });
+    supabase.from("orders").update({ status: ns, preparo_at: preparoAt }).eq("id", id).then(({ error }) => dbFail(error));
   };
   const skipOrder = (id) => {
     const o = orders.find((x) => x.id === id); if (!o) return;
@@ -1895,6 +2546,43 @@ function ComandaApp() {
     pushToast({ type: "undo", nome: o.nome, orderId: id, prevStatus, recebido: true, message: `entregue · ${fmtBRL(o.valor)} recebido`, duration: 5000 });
     supabase.from("orders").update({ status: "concluido", completed_at: ts, recebido_at: ts, skipped_at: null }).eq("id", id).then(({ error }) => dbFail(error));
   };
+  /* --- Fluxo de retirada ------------------------------------------ */
+  const readyPickup = (id) => {
+    const o = orders.find((x) => x.id === id); if (!o || o.status === "pronto_retirada") return;
+    const prevStatus = o.status; const ts = Date.now();
+    upsertOrder({ ...o, status: "pronto_retirada", readyAt: ts, skippedAt: null });
+    pushToast({ type: "undo", nome: o.nome, orderId: id, prevStatus, paraEntregador: true, message: "pronto p/ retirada", duration: 5000 });
+    supabase.from("orders").update({ status: "pronto_retirada", ready_at: ts, skipped_at: null }).eq("id", id).then(({ error }) => dbFail(error));
+  };
+  /* Cliente buscou. Se havia valor a receber, confirma o recebimento antes. */
+  const pickup = (id) => {
+    const o = orders.find((x) => x.id === id); if (!o || o.status === "concluido") return;
+    const ts = Date.now(); const rec = aReceber(o);
+    upsertOrder({ ...o, status: "concluido", completedAt: ts, recebidoAt: rec ? ts : o.recebidoAt });
+    pushToast({ type: "undo", nome: o.nome, orderId: id, prevStatus: o.status, recebido: rec, message: rec ? `retirado · ${fmtBRL(o.valor)} recebido` : "retirado", duration: 5000 });
+    supabase.from("orders").update({ status: "concluido", completed_at: ts, ...(rec ? { recebido_at: ts } : {}) }).eq("id", id).then(({ error }) => dbFail(error));
+  };
+  const requestPickup = (id) => {
+    const o = orders.find((x) => x.id === id); if (!o) return;
+    if (aReceber(o)) { setCobrandoRet(o); return; }
+    pickup(id);
+  };
+
+  /* --- Link de acompanhamento ------------------------------------- */
+  const showLink = (o) => {
+    setLinkOrderId(o.id);
+    if (!o.codigo) {
+      const codigo = resolverCodigo({ telefone: o.telefone }, o.id);
+      upsertOrder({ ...o, codigo });
+      supabase.from("orders").update({ codigo }).eq("id", o.id).then(({ error }) => dbFail(error));
+    }
+  };
+  const saveContato = (v) => {
+    setContato(v);
+    supabase.from("app_settings").upsert({ id: "singleton", active_menu_id: activeMenuId, whatsapp_contato: v }, { onConflict: "id" }).then(({ error }) => dbFail(error));
+    pushToast({ type: "success", message: "WhatsApp salvo", duration: 2000 });
+  };
+
   const backToKitchen = (id) => {
     const o = orders.find((x) => x.id === id); if (!o) return;
     upsertOrder({ ...o, status: "na_fila", readyAt: null, outAt: null });
@@ -1908,14 +2596,29 @@ function ComandaApp() {
     if (ids.length) supabase.from("orders").delete().in("id", ids).then(({ error }) => dbFail(error));
   };
 
+  /* Novo dia: apaga TODOS os pedidos (qualquer situação) e o chat, em todos os aparelhos. */
+  const clearAllDay = () => {
+    setOrders([]); setMessages([]); setPrefill(null);
+    supabase.from("orders").delete().neq("id", "").then(({ error }) => dbFail(error));
+    supabase.from("messages").delete().neq("id", "").then(({ error }) => dbFail(error));
+    pushToast({ type: "success", message: "Histórico apagado — pronto para um novo dia!", duration: 3000 });
+  };
+
   const repeatOrder = (order) => {
     setPrefill({ mode: "repeat", tipo: order.tipo, horario: order.horario, observacoes: order.observacoes, endereco: order.endereco, referencia: order.referencia, selections: order.selections });
     setFormSeed((n) => n + 1);
     setView("atendente");
   };
   const editOrder = (order) => {
-    setPrefill({ mode: "edit", editId: order.id, nome: order.nome, tipo: order.tipo, horario: order.horario, observacoes: order.observacoes, endereco: order.endereco, referencia: order.referencia,
+    setPrefill({ mode: "edit", editId: order.id, nome: order.nome, telefone: order.telefone, codigo: order.codigo, tipo: order.tipo, horario: order.horario, observacoes: order.observacoes, endereco: order.endereco, referencia: order.referencia,
       pagamento: order.pagamento, valor: order.valor, formaPagamento: order.formaPagamento, trocoPara: order.trocoPara, selections: order.selections });
+    setFormSeed((n) => n + 1);
+    setView("atendente");
+  };
+  /* Outro pedido para o mesmo cliente: mesmos dados e mesmo link, itens em branco. */
+  const moreOrder = (order) => {
+    setPrefill({ mode: "mais", nome: order.nome, telefone: order.telefone, codigo: order.codigo, tipo: order.tipo, horario: order.horario,
+      endereco: order.endereco, referencia: order.referencia, pagamento: temPagamento(order) && order.pagamento ? "junto" : "" });
     setFormSeed((n) => n + 1);
     setView("atendente");
   };
@@ -1938,13 +2641,15 @@ function ComandaApp() {
   };
 
   const entregasPendentes = orders.filter((o) => isEntregaAtiva(o)).length;
+  const retiradasProntas = orders.filter((o) => o.status === "pronto_retirada").length;
+  const linkOrder = linkOrderId ? orders.find((o) => o.id === linkOrderId) : null;
 
-  const navBtn = (target, icon, label, count) => (
+  const navBtn = (target, icon, label, count, cor = "bg-purple-600") => (
     <button onClick={() => setView(target)}
       className={"rounded-lg font-bold flex items-center justify-center gap-1.5 text-sm " + (view === target ? "bg-white text-slate-900 shadow" : "text-slate-500")} style={{ minHeight: "46px" }}>
       {icon} {label}
       {typeof count === "number" && count > 0 && (
-        <span className={"rounded-full text-xs px-1.5 " + (view === target ? "bg-purple-600 text-white" : "bg-purple-500 text-white")}>{count}</span>
+        <span className={"rounded-full text-xs px-1.5 text-white " + cor}>{count}</span>
       )}
     </button>
   );
@@ -1975,11 +2680,11 @@ function ComandaApp() {
 
         <div className="px-4 pb-3 max-w-xl mx-auto w-full">
           <div className="grid grid-cols-3 gap-1 bg-slate-200 rounded-xl p-1">
-            {navBtn("atendente", <User size={18} />, "Atendente")}
+            {navBtn("atendente", <User size={18} />, "Atendente", retiradasProntas, "bg-teal-600")}
             {navBtn("cozinha", <ChefHat size={18} />, "Cozinha")}
             {navBtn("entregador", <Bike size={18} />, "Entregador", entregasPendentes)}
           </div>
-          {view === "admin" && <div className="mt-2 text-center text-xs font-semibold text-slate-500">Modo administração — toque em Atendente ou Cozinha para voltar</div>}
+          {view === "admin" && <div className="mt-2 text-center text-xs font-semibold text-slate-500">Modo administração — toque em Atendente, Cozinha ou Entregador para voltar</div>}
         </div>
       </header>
 
@@ -1993,17 +2698,21 @@ function ComandaApp() {
           <>
             {view === "atendente" && (activeMenu ? (
               <AtendenteView orders={orders} menu={activeMenu} prefill={prefill} formSeed={formSeed} nowTs={nowTs} headerH={headerH}
-                onCreate={createOrder} onEdit={editOrder} onCancel={cancelOrder} onRepeat={repeatOrder} onConsumedPrefill={consumedPrefill} />
+                onCreate={createOrder} onEdit={editOrder} onCancel={cancelOrder} onRepeat={repeatOrder} onMore={moreOrder} onConsumedPrefill={consumedPrefill}
+                onPickup={requestPickup} onShowLink={showLink} />
             ) : <div className="p-8"><Empty>Nenhum cardápio ativo. Vá em Administração.</Empty></div>)}
             {view === "cozinha" && (
-              <CozinhaView orders={orders} nowTs={nowTs} headerH={headerH} onPrepare={prepareToggle} onComplete={completeOrder} onSkip={skipOrder} onBackToQueue={backToQueue} onClearHistory={clearHistory} onSendToDelivery={sendToDelivery} />
+              <CozinhaView orders={orders} nowTs={nowTs} headerH={headerH} onPrepare={prepareToggle} onComplete={completeOrder} onSkip={skipOrder} onBackToQueue={backToQueue} onClearHistory={clearHistory} onSendToDelivery={sendToDelivery}
+                onReadyPickup={readyPickup} onPickup={requestPickup} />
             )}
             {view === "entregador" && (
               <EntregadorView orders={orders} nowTs={nowTs} headerH={headerH} onStartRoute={startRoute} onDelivered={deliverOrder} onBackToKitchen={backToKitchen}
                 onCopied={() => pushToast({ type: "success", message: "Endereço copiado", duration: 1800 })} />
             )}
             {view === "admin" && (
-              <AdminView menus={menus} activeMenuId={activeMenuId} onCreateMenu={createMenu} onSaveMenu={saveMenu} onDeleteMenu={deleteMenu} onSetActive={setActive} />
+              <AdminView menus={menus} activeMenuId={activeMenuId} onCreateMenu={createMenu} onSaveMenu={saveMenu} onDeleteMenu={deleteMenu} onSetActive={setActive}
+                orders={orders} messagesCount={messages.length} onClearAll={clearAllDay}
+                contato={contato} onSaveContato={saveContato} userEmail={session && session.user ? session.user.email : ""} onLogout={() => supabase.auth.signOut()} />
             )}
           </>
         )}
@@ -2011,11 +2720,81 @@ function ComandaApp() {
 
       <ChatDrawer open={chatOpen} onClose={() => setChatOpen(false)} messages={messages} role={role} onSend={sendMessage} />
       <Toasts toasts={toasts} onUndo={undoComplete} />
+      <AlertaPopup alerta={alerta} onClose={fecharAlerta} />
+      <LinkModal order={linkOrder} orders={orders} onClose={() => setLinkOrderId(null)}
+        onCopied={() => pushToast({ type: "success", message: "Copiado!", duration: 1800 })} />
+      <RecebimentoModal order={cobrandoRet} onCancel={() => setCobrandoRet(null)}
+        onConfirm={() => { const o = cobrandoRet; setCobrandoRet(null); if (o) pickup(o.id); }} />
     </div>
   );
 }
 
+/* ================================================================== */
+/*  Login da equipe                                                    */
+/*  Só quem tem o e-mail/senha da equipe vê os pedidos. O cliente só   */
+/*  acessa a página de acompanhamento (endereço com ?p=CÓDIGO).        */
+/* ================================================================== */
+
+function LoginScreen() {
+  const [email, setEmail] = useState("");
+  const [senha, setSenha] = useState("");
+  const [erro, setErro] = useState("");
+  const [entrando, setEntrando] = useState(false);
+  const [codigo, setCodigo] = useState("");
+
+  const entrar = async (e) => {
+    e.preventDefault();
+    setErro(""); setEntrando(true);
+    const { error } = await supabase.auth.signInWithPassword({ email: email.trim(), password: senha });
+    setEntrando(false);
+    if (error) setErro(/invalid/i.test(error.message) ? "E-mail ou senha incorretos." : "Não foi possível entrar: " + error.message);
+  };
+  const inputCls = "w-full rounded-xl border-2 border-slate-200 px-4 text-base text-slate-900 outline-none focus:border-emerald-500";
+
+  return (
+    <div className="min-h-screen flex items-center justify-center p-5" style={{ backgroundColor: "#f1f5f9" }}>
+      <div className="w-full space-y-4" style={{ maxWidth: "400px" }}>
+        <form onSubmit={entrar} className="rounded-2xl bg-white border-2 border-slate-200 p-6 space-y-3">
+          <div className="flex items-center gap-2 font-extrabold text-slate-800 text-xl">
+            <span className="rounded-lg bg-emerald-600 text-white p-1.5"><Utensils size={20} /></span> Comanda Digital
+          </div>
+          <p className="text-sm text-slate-500">Acesso da equipe (atendente, cozinha e entregador). Basta entrar uma vez em cada aparelho.</p>
+          <input value={email} onChange={(e) => setEmail(e.target.value)} type="email" autoComplete="username" placeholder="E-mail da equipe" className={inputCls} style={{ minHeight: "52px" }} />
+          <input value={senha} onChange={(e) => setSenha(e.target.value)} type="password" autoComplete="current-password" placeholder="Senha" className={inputCls} style={{ minHeight: "52px" }} />
+          {erro && <p className="text-sm text-red-600 font-semibold">{erro}</p>}
+          <button type="submit" disabled={entrando || !email.trim() || !senha}
+            className={"w-full rounded-xl font-extrabold text-lg flex items-center justify-center gap-2 " + (entrando || !email.trim() || !senha ? "bg-slate-300 text-slate-500" : "bg-emerald-600 text-white active:bg-emerald-700")} style={{ minHeight: "56px" }}>
+            <Lock size={20} /> {entrando ? "Entrando…" : "Entrar"}
+          </button>
+        </form>
+
+        <form onSubmit={(e) => { e.preventDefault(); const c = limpaCodigo(codigo); if (c.length >= 4) window.location.href = `/?p=${c}`; }}
+          className="rounded-2xl bg-white border-2 border-slate-200 p-5 space-y-2">
+          <div className="font-bold text-slate-700 flex items-center gap-2"><Search size={18} /> É cliente? Acompanhe seu pedido</div>
+          <div className="flex gap-2">
+            <input value={codigo} onChange={(e) => setCodigo(e.target.value.toUpperCase())} placeholder="Seu código (ex: K7P2QX)"
+              className={inputCls + " font-mono tracking-widest uppercase"} style={{ minHeight: "50px" }} />
+            <button type="submit" className="rounded-xl bg-slate-900 text-white font-bold px-4">Ver</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function StaffGate() {
+  const [session, setSession] = useState(undefined); // undefined = verificando
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session || null));
+    const { data } = supabase.auth.onAuthStateChange((_ev, sess) => setSession(sess || null));
+    return () => data.subscription.unsubscribe();
+  }, []);
+  if (session === undefined) return <div className="min-h-screen flex items-center justify-center text-slate-400 font-medium" style={{ backgroundColor: "#f1f5f9" }}>Carregando…</div>;
+  if (!session) return <LoginScreen />;
+  return <ComandaApp key={session.user.id} session={session} />;
+}
+
 export default function App() {
   if (!isConfigured) return <SetupNeeded />;
-  return <ComandaApp />;
+  return <StaffGate />;
 }
